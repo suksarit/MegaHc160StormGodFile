@@ -80,11 +80,11 @@ constexpr uint8_t CH_RESET = 7;
 constexpr uint8_t CH_STARTER = 10;
 
 // ===== Time Budget (ms) =====
-#define BUDGET_SENSORS_MS 5
+#define BUDGET_SENSORS_MS 30
 #define BUDGET_COMMS_MS 3
 #define BUDGET_DRIVE_MS 2
 #define BUDGET_BLADE_MS 2
-#define BUDGET_LOOP_MS 20
+#define BUDGET_LOOP_MS 40
 
 // ============================================================================
 // FUNCTION PROTOTYPES (FINAL / MATCH ARDUINO ABI)
@@ -1021,9 +1021,42 @@ void updateComms(uint32_t now) {
   wdCommsOK = true;
 }
 
+void checkI2CBus(uint32_t now) {
+  static uint8_t resetCount = 0;
+  static uint32_t lastResetMs = 0;
 
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+
+    if (now - lastResetMs > 3000) {
+      resetCount = 0;
+    }
+
+    if (resetCount < 3) {
+      Wire.end();
+      delayMicroseconds(200);
+      Wire.begin();
+
+      adsCur.begin(0x48);
+      adsCur.setGain(GAIN_ONE);
+
+      adsVolt.begin(0x49);
+      adsVolt.setGain(GAIN_ONE);
+
+      lastResetMs = now;
+      resetCount++;
+
+#if DEBUG_SERIAL
+      Serial.println(F("[I2C] BUS RESET"));
+#endif
+    } else {
+      latchFault(FaultCode::VOLT_SENSOR_FAULT);
+    }
+  }
+}
 
 void updateSensors() {
+
   uint32_t now = millis();
 
 #if TEST_MODE
@@ -1034,6 +1067,49 @@ void updateSensors() {
   wdSensorOK = true;
   return;
 #endif
+
+  // ==================================================
+  // I2C BUS RECOVERY (LIMITED RESET)
+  // ==================================================
+  {
+    static uint8_t resetCount = 0;
+    static uint32_t lastResetMs = 0;
+
+    if (Wire.getWireTimeoutFlag()) {
+
+      Wire.clearWireTimeoutFlag();
+
+      if (now - lastResetMs > 3000) {
+        resetCount = 0;
+      }
+
+      if (resetCount < 3) {
+
+        Wire.end();
+        delayMicroseconds(200);
+        Wire.begin();
+        Wire.setClock(100000);
+        Wire.setWireTimeout(6000, true);
+
+        // re-init ADS1115 ทั้งสองตัว
+        adsCur.begin(0x48);
+        adsCur.setGain(GAIN_ONE);
+
+        adsVolt.begin(0x49);
+        adsVolt.setGain(GAIN_ONE);
+
+        lastResetMs = now;
+        resetCount++;
+
+#if DEBUG_SERIAL
+        Serial.println(F("[I2C] BUS RESET"));
+#endif
+      } else {
+        latchFault(FaultCode::VOLT_SENSOR_FAULT);
+        return;
+      }
+    }
+  }
 
   // ==================================================
   // HARDWARE OVERCURRENT TRIP (µs-level)
@@ -1054,16 +1130,13 @@ void updateSensors() {
     uint8_t adsCh = ADS_CUR_CH_MAP[idx];
     float a = readCurrentADC(adsCh, idx);
 
-    // plausibility
     if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE) {
       latchFault(FaultCode::CUR_SENSOR_FAULT);
       return;
     }
 
-    // IIR LPF
     curA[idx] += CUR_LPF_ALPHA * (a - curA[idx]);
 
-    // stuck detect (PWM active)
     if (abs(curL) > 200 || abs(curR) > 200) {
       if (fabs(curA[idx] - lastCurA[idx]) < 0.03f) {
         if (++stuckCnt[idx] > 40) {
@@ -1074,15 +1147,14 @@ void updateSensors() {
         stuckCnt[idx] = 0;
       }
     }
+
     lastCurA[idx] = curA[idx];
 
-    // spike protect
     if (a > CUR_SPIKE_A) {
       forceDriveSoftStop(now);
       bladeState = BladeState::SOFT_STOP;
     }
 
-    // overcurrent latch
     if (a > CUR_TRIP_A_CH[idx]) {
       if (++overCurCnt[idx] >= 2) {
         latchFault(FaultCode::OVER_CURRENT);
@@ -1434,13 +1506,7 @@ void updateStarter(uint32_t now) {
   // =====================================================
   // 1️⃣ HARD SAFETY GATE (BLOCK EVERYTHING)
   // =====================================================
-  if (systemState == SystemState::FAULT ||
-      driveState != DriveState::IDLE ||
-      ibus.readChannel(CH_ENGINE) > 1100 ||
-      !neutral(ibus.readChannel(CH_THROTTLE)) ||
-      !ignitionOn ||
-      engineRunning ||
-      (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS)) {
+  if (systemState == SystemState::FAULT || driveState != DriveState::IDLE || ibus.readChannel(CH_ENGINE) > 1100 || !neutral(ibus.readChannel(CH_THROTTLE)) || !ignitionOn || engineRunning || (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS)) {
 
     starterActive = false;
     digitalWrite(RELAY_STARTER, LOW);
@@ -1647,10 +1713,10 @@ void setup() {
 
   adsCur.begin(0x48);  // ADS1115 กระแส
   adsCur.setGain(GAIN_ONE);
-
+  adsCur.setDataRate(RATE_ADS1115_860SPS);
   adsVolt.begin(0x49);  // ADS1115 แรงดัน
   adsVolt.setGain(GAIN_ONE);
-
+  adsVolt.setDataRate(RATE_ADS1115_860SPS);
   // --------------------------------------------------
   // READ LAST FAULT FROM EEPROM (FAULT HISTORY)
   // --------------------------------------------------
@@ -1829,27 +1895,26 @@ void loop() {
   detectWheelLock();
 
   SafetyInput sin;
-memcpy(sin.curA, curA, sizeof(curA));
-sin.tempDriverL = tempDriverL;
-sin.tempDriverR = tempDriverR;
-sin.faultLatched = faultLatched;
+  memcpy(sin.curA, curA, sizeof(curA));
+  sin.tempDriverL = tempDriverL;
+  sin.tempDriverR = tempDriverR;
+  sin.faultLatched = faultLatched;
 
-SafetyThresholds sth = {
-  CUR_WARN_A,
-  CUR_LIMP_A,
-  TEMP_WARN_C,
-  TEMP_LIMP_C
-};
+  SafetyThresholds sth = {
+    CUR_WARN_A,
+    CUR_LIMP_A,
+    TEMP_WARN_C,
+    TEMP_LIMP_C
+  };
 
-SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
+  SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
 
-updateSafetyStability(
-  rawSafety,
-  now,
-  autoReverseCount,
-  autoReverseActive,
-  lastDriveEvent
-);
+  updateSafetyStability(
+    rawSafety,
+    now,
+    autoReverseCount,
+    autoReverseActive,
+    lastDriveEvent);
 
 
   // ==================================================
@@ -1995,4 +2060,3 @@ LOOP_FAULT_EXIT:
   wdCommsOK = wdSensorOK = wdDriveOK = wdBladeOK = true;
   return;
 }
-
