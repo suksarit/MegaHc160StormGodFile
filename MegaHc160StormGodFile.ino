@@ -1161,6 +1161,9 @@ void updateCurrentAsync(uint32_t now)
   adsAsync.conversionRunning = false;
 }
 
+// ============================================================================
+// updateSensors()  (NON-BLOCKING STATE MACHINE VERSION)
+// ============================================================================
 void updateSensors()
 {
   uint32_t now = millis();
@@ -1175,44 +1178,68 @@ void updateSensors()
 #endif
 
   // ==================================================
-  // I2C BUS RECOVERY (LIMITED RESET)
+  // ---------- I2C RECOVERY STATE MACHINE ----------
   // ==================================================
+  enum class I2CRecoverState : uint8_t {
+    IDLE,
+    END_BUS,
+    BEGIN_BUS,
+    REINIT_ADS,
+    DONE
+  };
+
+  static I2CRecoverState i2cState = I2CRecoverState::IDLE;
+  static uint32_t i2cStateStart_ms = 0;
+  static uint8_t  i2cResetCount = 0;
+
+  if (Wire.getWireTimeoutFlag() && i2cState == I2CRecoverState::IDLE)
   {
-    static uint8_t resetCount = 0;
-    static uint32_t lastResetMs = 0;
+    Wire.clearWireTimeoutFlag();
+    i2cState = I2CRecoverState::END_BUS;
+    i2cStateStart_ms = now;
+  }
 
-    if (Wire.getWireTimeoutFlag())
-    {
-      Wire.clearWireTimeoutFlag();
+  switch (i2cState)
+  {
+    case I2CRecoverState::END_BUS:
+      Wire.end();
+      i2cState = I2CRecoverState::BEGIN_BUS;
+      break;
 
-      if (now - lastResetMs > 3000)
-        resetCount = 0;
-
-      if (resetCount < 3)
+    case I2CRecoverState::BEGIN_BUS:
+      if (now - i2cStateStart_ms >= 1)   // 1ms spacing
       {
-        Wire.end();
-        delayMicroseconds(200);
         Wire.begin();
         Wire.setClock(100000);
         Wire.setWireTimeout(6000, true);
-
-        adsCur.begin(0x48);
-        adsCur.setGain(GAIN_ONE);
-        adsCur.setDataRate(RATE_ADS1115_860SPS);
-
-        adsVolt.begin(0x49);
-        adsVolt.setGain(GAIN_ONE);
-        adsVolt.setDataRate(RATE_ADS1115_860SPS);
-
-        lastResetMs = now;
-        resetCount++;
+        i2cState = I2CRecoverState::REINIT_ADS;
       }
-      else
+      break;
+
+    case I2CRecoverState::REINIT_ADS:
+      adsCur.begin(0x48);
+      adsCur.setGain(GAIN_ONE);
+      adsCur.setDataRate(RATE_ADS1115_860SPS);
+
+      adsVolt.begin(0x49);
+      adsVolt.setGain(GAIN_ONE);
+      adsVolt.setDataRate(RATE_ADS1115_860SPS);
+
+      i2cResetCount++;
+      i2cState = I2CRecoverState::DONE;
+      break;
+
+    case I2CRecoverState::DONE:
+      if (i2cResetCount >= 3)
       {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
         return;
       }
-    }
+      i2cState = I2CRecoverState::IDLE;
+      break;
+
+    default:
+      break;
   }
 
   // ==================================================
@@ -1225,12 +1252,10 @@ void updateSensors()
   }
 
   // ==================================================
-  // ASYNC CURRENT (1 channel per loop)
+  // ----------- ASYNC CURRENT (1 CH PER LOOP) -------
   // ==================================================
   static uint8_t curIdx = 0;
   static bool curConvRunning = false;
-  static float lastCurA[4] = {0};
-  static uint8_t stuckCnt[4] = {0};
 
   if (!curConvRunning)
   {
@@ -1244,7 +1269,6 @@ void updateSensors()
   else if (adsCur.conversionComplete())
   {
     int16_t raw = adsCur.getLastConversionResults();
-
     float v = raw * ADS1115_LSB_V;
     float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
 
@@ -1255,24 +1279,6 @@ void updateSensors()
     }
 
     curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
-
-    if (abs(curL) > 200 || abs(curR) > 200)
-    {
-      if (fabs(curA[curIdx] - lastCurA[curIdx]) < 0.03f)
-      {
-        if (++stuckCnt[curIdx] > 40)
-        {
-          latchFault(FaultCode::CUR_SENSOR_FAULT);
-          return;
-        }
-      }
-      else
-      {
-        stuckCnt[curIdx] = 0;
-      }
-    }
-
-    lastCurA[curIdx] = curA[curIdx];
 
     if (a > CUR_SPIKE_A)
     {
@@ -1294,38 +1300,28 @@ void updateSensors()
     }
 
     curIdx++;
-    if (curIdx >= 4)
-      curIdx = 0;
-
+    if (curIdx >= 4) curIdx = 0;
     curConvRunning = false;
   }
 
   // ==================================================
-  // ASYNC VOLTAGE (1 sample / 50ms window)
+  // ----------- ASYNC VOLTAGE (50ms window) ----------
   // ==================================================
   static bool voltConvRunning = false;
   static uint32_t lastVoltTrigger_ms = 0;
   static uint32_t lastVoltOk_ms = 0;
 
-  constexpr uint8_t ADS_VOLT_CH = 0;
-  constexpr float DIV_RATIO = (150.0f + 33.0f) / 33.0f;
-
   if (!voltConvRunning && (now - lastVoltTrigger_ms >= 50))
   {
-    uint16_t mux =
-      ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
-      (ADS_VOLT_CH << 12);
-
-    adsVolt.startADCReading(mux, false);
+    adsVolt.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
     voltConvRunning = true;
     lastVoltTrigger_ms = now;
   }
   else if (voltConvRunning && adsVolt.conversionComplete())
   {
     int16_t raw = adsVolt.getLastConversionResults();
-
     float v_adc = raw * ADS1115_LSB_V;
-    float vRaw = v_adc * DIV_RATIO;
+    float vRaw = v_adc * ((150.0f + 33.0f) / 33.0f);
 
     if (vRaw > 0.0f && vRaw < 40.0f)
     {
@@ -1343,7 +1339,7 @@ void updateSensors()
   }
 
   // ==================================================
-  // TEMPERATURE (100ms)
+  // ----------- TEMPERATURE (100ms window) ----------
   // ==================================================
   static uint32_t lastTemp_ms = 0;
   static uint32_t lastTempOk_ms = 0;
