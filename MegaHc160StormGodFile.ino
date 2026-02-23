@@ -927,15 +927,21 @@ void driveSafe() {
 // latchFault  (WITH EEPROM FAULT HISTORY)
 // ============================================================================
 void latchFault(FaultCode code) {
+
   if (faultLatched) return;
 
   activeFault = code;
   faultLatched = true;
 
   // ==================================================
-  // STORE LAST FAULT TO EEPROM (PERSISTENT)
+  // STORE LAST FAULT TO EEPROM (WRITE ONLY IF CHANGED)
   // ==================================================
-  EEPROM.put(100, code);  // เก็บ fault ล่าสุด (1 byte)
+  FaultCode lastStored;
+  EEPROM.get(100, lastStored);
+
+  if (lastStored != code) {
+    EEPROM.put(100, code);
+  }
 
 #if DEBUG_SERIAL
   Serial.println(F("========== FAULT SNAPSHOT =========="));
