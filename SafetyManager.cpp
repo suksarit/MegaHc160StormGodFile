@@ -1,11 +1,12 @@
 // ========================================================================================
-// SafetyManager.cpp  
+// SafetyManager.cpp  (TESTABLE / FIELD-SAFE)
 // ========================================================================================
 
 #include "SafetyManager.h"
+#include <Arduino.h>   // for max()
 
 // ============================================================================
-// INTERNAL SAFETY STABILITY STATE (PRIVATE TO THIS FILE)
+// INTERNAL SAFETY STABILITY STATE (PRIVATE)
 // ============================================================================
 enum class SafetyStabilityState : uint8_t {
   SAFE_TRANSIENT = 0,
@@ -13,47 +14,48 @@ enum class SafetyStabilityState : uint8_t {
 };
 
 // ============================================================================
-// INTERNAL FILTER COUNTERS (FIELD HARDENING)
+// INTERNAL FILTER COUNTERS
 // ============================================================================
 static uint8_t limpCnt = 0;
 static uint8_t warnCnt = 0;
 
-// ต้องเกิดต่อเนื่องกี่รอบจึงถือว่า “จริง”
 static constexpr uint8_t LIMP_CONFIRM_CNT = 3;
 static constexpr uint8_t WARN_CONFIRM_CNT = 2;
 
 // ============================================================================
-// INTERNAL SAFETY STABILITY STATE
+// INTERNAL STABILITY TRACKER
 // ============================================================================
 static SafetyStabilityState safetyStability = SafetyStabilityState::SAFE_TRANSIENT;
 static uint32_t safeStableStart_ms = 0;
 static constexpr uint32_t SAFE_STABLE_TIME_MS = 2000;
 
 // ============================================================================
-// RAW SAFETY EVALUATION (PURE LOGIC, FILTERED, FIELD SAFE)
+// RAW SAFETY EVALUATION (PURE FUNCTION)
 // ============================================================================
-SafetyState evaluateSafetyRaw() {
-
+SafetyState evaluateSafetyRaw(
+  const SafetyInput& in,
+  const SafetyThresholds& th
+) {
   // --------------------------------------------------
   // HARD FAULT ALWAYS WINS
   // --------------------------------------------------
-  if (faultLatched) {
+  if (in.faultLatched) {
     limpCnt = 0;
     warnCnt = 0;
     return SafetyState::EMERGENCY;
   }
 
   float curMax = max(
-    max(curA[0], curA[1]),
-    max(curA[2], curA[3])
+    max(in.curA[0], in.curA[1]),
+    max(in.curA[2], in.curA[3])
   );
 
   // --------------------------------------------------
-  // LIMP CONDITION (REQUIRES CONFIRMATION)
+  // LIMP CONDITION
   // --------------------------------------------------
-  if (curMax > CUR_LIMP_A ||
-      tempDriverL > TEMP_LIMP_C ||
-      tempDriverR > TEMP_LIMP_C) {
+  if (curMax > th.CUR_LIMP_A ||
+      in.tempDriverL > th.TEMP_LIMP_C ||
+      in.tempDriverR > th.TEMP_LIMP_C) {
 
     warnCnt = 0;
 
@@ -62,15 +64,15 @@ SafetyState evaluateSafetyRaw() {
       return SafetyState::LIMP;
     }
 
-    return SafetyState::WARN;   // ยังไม่ถึง LIMP จริง
+    return SafetyState::WARN;
   }
 
   // --------------------------------------------------
-  // WARN CONDITION (REQUIRES CONFIRMATION)
+  // WARN CONDITION
   // --------------------------------------------------
-  if (curMax > CUR_WARN_A ||
-      tempDriverL > TEMP_WARN_C ||
-      tempDriverR > TEMP_WARN_C) {
+  if (curMax > th.CUR_WARN_A ||
+      in.tempDriverL > th.TEMP_WARN_C ||
+      in.tempDriverR > th.TEMP_WARN_C) {
 
     limpCnt = 0;
 
@@ -91,17 +93,22 @@ SafetyState evaluateSafetyRaw() {
 }
 
 // ============================================================================
-// SAFETY STABILITY STATE MACHINE (HYSTERESIS + AUTO-RECOVERY CONTROL)
+// SAFETY STABILITY STATE MACHINE
 // ============================================================================
-void updateSafetyStability(SafetyState raw, uint32_t now) {
-
+void updateSafetyStability(
+  SafetyState raw,
+  uint32_t now,
+  uint8_t& autoReverseCount,
+  bool& autoReverseActive,
+  volatile DriveEvent& lastDriveEvent
+) {
   // --------------------------------------------------
   // PUBLISH RAW SAFETY
   // --------------------------------------------------
   driveSafety = raw;
 
   // --------------------------------------------------
-  // NOT SAFE → IMMEDIATE RESET STABILITY
+  // NOT SAFE → RESET STABILITY
   // --------------------------------------------------
   if (raw != SafetyState::SAFE) {
     safetyStability    = SafetyStabilityState::SAFE_TRANSIENT;
@@ -110,7 +117,7 @@ void updateSafetyStability(SafetyState raw, uint32_t now) {
   }
 
   // --------------------------------------------------
-  // SAFE → WAIT FOR STABILITY TIME
+  // SAFE → WAIT FOR STABLE TIME
   // --------------------------------------------------
   if (safetyStability == SafetyStabilityState::SAFE_TRANSIENT) {
 
@@ -123,12 +130,13 @@ void updateSafetyStability(SafetyState raw, uint32_t now) {
 
       safetyStability = SafetyStabilityState::SAFE_STABLE;
 
-      // ===== RESET AUTO-REVERSE (ONLY WHEN FULLY STABLE) =====
+      // RESET AUTO-REVERSE ONLY WHEN FULLY SAFE
       autoReverseCount  = 0;
       autoReverseActive = false;
       lastDriveEvent    = DriveEvent::NONE;
     }
   }
-
-  // SAFE_STABLE → hold state
 }
+
+
+

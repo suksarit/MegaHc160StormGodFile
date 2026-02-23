@@ -1,44 +1,59 @@
 // ========================================================================================
-// SafetyManager.h
+// SafetyManager.h  (TESTABLE / FIELD-SAFE)
 // ========================================================================================
 
 #ifndef SAFETY_MANAGER_H
 #define SAFETY_MANAGER_H
 
+#include <stdint.h>
 #include "SystemTypes.h"   // SafetyState, DriveEvent
 
 // ============================================================================
-// EXTERN RUNTIME STATES (owned by SafetyManager.cpp)
+// SAFETY INPUT SNAPSHOT (PURE DATA, NO GLOBAL DEPENDENCY)
+// ============================================================================
+struct SafetyInput {
+  float   curA[4];        // กระแสแต่ละช่อง
+  int16_t tempDriverL;    // อุณหภูมิไดรเวอร์ซ้าย
+  int16_t tempDriverR;    // อุณหภูมิไดรเวอร์ขวา
+  bool    faultLatched;   // fault ระดับระบบ
+};
+
+// ============================================================================
+// SAFETY THRESHOLDS (INJECTABLE → UNIT TESTABLE)
+// ============================================================================
+struct SafetyThresholds {
+  int16_t CUR_WARN_A;
+  int16_t CUR_LIMP_A;
+  int16_t TEMP_WARN_C;
+  int16_t TEMP_LIMP_C;
+};
+
+// ============================================================================
+// PUBLIC RUNTIME STATE (OWNED BY SafetyManager)
 // ============================================================================
 extern SafetyState driveSafety;
 
 // ============================================================================
-// EXTERN SENSOR RUNTIME VALUES (owned by .ino)
-// ============================================================================
-extern float   curA[4];
-extern int16_t tempDriverL;
-extern int16_t tempDriverR;
-
-// ============================================================================
-// EXTERN AUTO-REVERSE CONTROL
-// ============================================================================
-extern uint8_t autoReverseCount;
-extern bool    autoReverseActive;
-extern volatile DriveEvent lastDriveEvent;
-extern bool    faultLatched;
-
-// ============================================================================
-// EXTERN THRESHOLDS (defined in .ino, NOT constexpr)
-// ============================================================================
-extern const int16_t CUR_WARN_A;
-extern const int16_t CUR_LIMP_A;
-extern const int16_t TEMP_WARN_C;
-extern const int16_t TEMP_LIMP_C;
-
-// ============================================================================
 // PUBLIC API
 // ============================================================================
-SafetyState evaluateSafetyRaw();
-void updateSafetyStability(SafetyState raw, uint32_t now);
+
+// PURE LOGIC: ไม่มี side-effect, ไม่มี global access
+SafetyState evaluateSafetyRaw(
+  const SafetyInput& in,
+  const SafetyThresholds& th
+);
+
+// STATE MACHINE: hysteresis + recovery control
+void updateSafetyStability(
+  SafetyState raw,
+  uint32_t now,
+  uint8_t& autoReverseCount,
+  bool& autoReverseActive,
+  volatile DriveEvent& lastDriveEvent
+);
 
 #endif  // SAFETY_MANAGER_H
+
+
+
+
