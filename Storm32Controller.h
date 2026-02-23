@@ -1,7 +1,3 @@
-// ========================================================================================
-// Storm32Controller.h  
-// ========================================================================================
-
 #ifndef STORM32_CONTROLLER_H
 #define STORM32_CONTROLLER_H
 
@@ -9,31 +5,25 @@
 #include <IBusBM.h>
 #include <EEPROM.h>
 
-// ================= EEPROM =================
 #define EEPROM_STORM32_BASE 200
 #define STORM32_MAGIC 0x32B3
 
-// ================= iBUS Channels =================
+#define STORM32_START_BYTE  0xFA
+#define STORM32_CMD_CONTROL 0x19
+
 #define STORM32_CH_PITCH 3
 #define STORM32_CH_YAW   9
 
-// ================= Storm32 Binary =================
-#define STORM32_CMD_CONTROL 0x19
-#define STORM32_START_BYTE  0xFA
+#define STORM32_MAX_FRAME 32
 
-// ================= State =================
-// NOTE:
-// - EMERGENCY = LATCHED (ออกไม่ได้เอง)
-// - ต้องปลดด้วย clearEmergency() จากระบบรถเท่านั้น
 enum class Storm32State : uint8_t {
-  INIT,        // boot / ยังไม่อนุญาตให้ขยับ
-  OK,          // ปกติ
-  DEGRADED,    // ack ช้า / ลด slew
-  LOST,        // เกือบขาดการสื่อสาร
-  EMERGENCY    // LOCKED HARD
+  INIT,
+  OK,
+  DEGRADED,
+  LOST,
+  EMERGENCY
 };
 
-// ================= Config =================
 struct Storm32Config {
   bool invertPitch;
   bool invertYaw;
@@ -41,8 +31,8 @@ struct Storm32Config {
   float pitchLimitDeg;
   float yawLimitDeg;
 
-  float slewNormal;
-  float slewDegraded;
+  float slewNormal;     // deg/sec
+  float slewDegraded;   // deg/sec
 
   uint16_t ackTimeout1;
   uint16_t ackTimeout2;
@@ -53,101 +43,65 @@ struct Storm32Config {
 
 class Storm32Controller {
 public:
-  // ------------------------------------------------
-  // Constructor / lifecycle
-  // ------------------------------------------------
   Storm32Controller(HardwareSerial& serial, IBusBM& ibus);
-  void begin();
 
-  // update() จะทำงานได้ก็ต่อเมื่อ systemEnabled == true
+  void begin();
   void update(uint32_t now);
 
-  // ------------------------------------------------
-  // Safety / Control API (MASTER = ระบบรถ)
-  // ------------------------------------------------
-
-  // HARD LATCH: เข้าสู่ EMERGENCY และล็อกถาวร
   void forceOff();
-
-  // Override ระดับ hardware / logic (TRUE = ปิด 100%)
   void hardDisable(bool enable);
-
-  // เปิด/ปิดการอนุญาตจากระบบรถ (ACTIVE / NOT ACTIVE)
   void setSystemEnabled(bool enable);
-
-  // ปลด EMERGENCY (อนุญาตเฉพาะระบบรถ)
   void clearEmergency();
 
-  // ------------------------------------------------
-  // Status
-  // ------------------------------------------------
   Storm32State getState() const;
-
-  // true = ห้าม gimbal ขยับ (รวม INIT / EMERGENCY / hardDisable / systemDisabled)
   bool isLocked() const;
 
 private:
-  // ------------------------------------------------
-  // External interfaces
-  // ------------------------------------------------
   HardwareSerial& stormSerial;
   IBusBM& ibus;
 
-  // ------------------------------------------------
-  // Config / State
-  // ------------------------------------------------
   Storm32Config cfg;
   Storm32State state;
 
-  bool hardDisabled;     // override จากระบบหลัก
-  bool systemEnabled;   // อนุญาตจาก systemState (ACTIVE เท่านั้น)
+  bool hardDisabled;
+  bool systemEnabled;
 
   uint32_t lastAckMs;
-  uint32_t stateEnterMs;
   uint32_t lastTxMs;
+  uint32_t lastUpdateMs;
 
-  // ------------------------------------------------
-  // Motion state
-  // ------------------------------------------------
   float targetPitch;
   float targetYaw;
   float currentPitch;
   float currentYaw;
 
-  // ------------------------------------------------
-  // Core
-  // ------------------------------------------------
-  void processSerial();
-  void updateWDT(uint32_t now);
+  // ===== FRAME PARSER =====
+  uint8_t frameBuf[STORM32_MAX_FRAME];
+  uint8_t frameIndex;
+  uint8_t frameLength;
+  bool    frameActive;
 
-  // enterState() จะไม่อนุญาตออกจาก EMERGENCY
+  void processSerial(uint32_t now);
+  void parseByte(uint8_t b, uint32_t now);
+  void handleFrame(uint8_t* buf, uint8_t len, uint32_t now);
+
+  void updateWDT(uint32_t now);
   void enterState(Storm32State newState);
 
-  // ------------------------------------------------
-  // Control
-  // ------------------------------------------------
   void updateTargetFromIBUS();
-  void applyMotion(uint32_t now);
+  void applyMotion(float dt);
 
-  // ------------------------------------------------
-  // Utility
-  // ------------------------------------------------
   float mapRCtoDeg(uint16_t rc, float limit, bool invert);
-  float stepToward(float cur, float tgt, float step);
+  float stepToward(float cur, float tgt, float maxStep);
 
-  // ------------------------------------------------
-  // Storm32 Binary Commands
-  // ------------------------------------------------
   void sendBinaryControl(int16_t pitch, int16_t yaw);
   void sendDriveOff();
-  uint8_t calcChecksum(const uint8_t* buf, uint8_t len);
 
-  // ------------------------------------------------
-  // EEPROM
-  // ------------------------------------------------
+  uint16_t crc16_ccitt(const uint8_t* data, uint8_t len);
+
   void loadConfig();
   void saveConfig();
   void setDefaultConfig();
 };
 
-#endif  // STORM32_CONTROLLER_H
+#endif
