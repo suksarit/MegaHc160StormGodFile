@@ -1419,55 +1419,55 @@ void updateIgnition() {
 }
 
 void updateStarter(uint32_t now) {
+
   uint16_t ch10 = ibus.readChannel(CH_STARTER);
   bool requestStart = (ch10 > 1600);
-  // =========================
-  // HARD SAFETY BLOCK (FIELD SAFE)
-  // =========================
+
   bool ignitionOn = digitalRead(RELAY_IGNITION);
-  if (systemState == SystemState::FAULT ||                                              // ระบบอยู่ใน FAULT
-      driveState != DriveState::IDLE ||                                                 // รถต้องหยุดนิ่ง
-      ibus.readChannel(CH_ENGINE) > 1100 || !neutral(ibus.readChannel(CH_THROTTLE)) ||  // คันเร่งต้องอยู่กลาง
-      !ignitionOn ||                                                                    // ต้องเปิดกุญแจก่อน
-      engineRunning ||                                                                  // เครื่องติดอยู่แล้ว
-      (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS)) {    // กันสตาร์ทถี่
-#if DEBUG_SERIAL
-    if (!ignitionOn) {
-      Serial.println(F("[STARTER BLOCK] IGNITION OFF"));
-    } else if (engineRunning) {
-      Serial.println(F("[STARTER BLOCK] ENGINE RUNNING"));
-    } else if (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS) {
-      Serial.println(F("[STARTER BLOCK] RESTART GUARD ACTIVE"));
-    }
-#endif
+
+  // =====================================================
+  // 1️⃣ HARD SAFETY GATE (BLOCK EVERYTHING)
+  // =====================================================
+  if (systemState == SystemState::FAULT ||
+      driveState != DriveState::IDLE ||
+      ibus.readChannel(CH_ENGINE) > 1100 ||
+      !neutral(ibus.readChannel(CH_THROTTLE)) ||
+      !ignitionOn ||
+      engineRunning ||
+      (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS)) {
+
     starterActive = false;
     digitalWrite(RELAY_STARTER, LOW);
     return;
   }
-  // =========================
-  // START REQUEST
-  // =========================
-  if (requestStart && !starterActive) {
+
+  // =====================================================
+  // 2️⃣ IF STARTER IS ACTIVE → HANDLE TIMEOUT ONLY
+  // =====================================================
+  if (starterActive) {
+
+    if (!requestStart || (now - starterStart_ms > STARTER_MAX_MS)) {
+
+      starterActive = false;
+      digitalWrite(RELAY_STARTER, LOW);
+
+      // ถ้าเครื่องยังไม่ติด → ถือว่าสตาร์ทล้มเหลว
+      if (!engineRunning) {
+        engineStopped_ms = now;
+      }
+    }
+
+    return;
+  }
+
+  // =====================================================
+  // 3️⃣ NEW START REQUEST
+  // =====================================================
+  if (requestStart) {
+
     starterActive = true;
     starterStart_ms = now;
     digitalWrite(RELAY_STARTER, HIGH);
-    return;
-  }
-  // =========================
-  // AUTO TIMEOUT + START FAILED DETECT
-  // =========================
-  if (starterActive) {
-    if (!requestStart || now - starterStart_ms > STARTER_MAX_MS) {
-      starterActive = false;
-      digitalWrite(RELAY_STARTER, LOW);
-      // เครื่องไม่ติด → ถือว่าเพิ่งหยุด
-      if (!engineRunning) {
-        engineStopped_ms = now;
-#if DEBUG_SERIAL
-        Serial.println(F("[STARTER] START FAILED"));
-#endif
-      }
-    }
   }
 }
 
@@ -1822,8 +1822,29 @@ void loop() {
   detectWheelStuck(now);
   detectWheelLock();
 
-  SafetyState rawSafety = evaluateSafetyRaw();
-  updateSafetyStability(rawSafety, now);
+  SafetyInput sin;
+memcpy(sin.curA, curA, sizeof(curA));
+sin.tempDriverL = tempDriverL;
+sin.tempDriverR = tempDriverR;
+sin.faultLatched = faultLatched;
+
+SafetyThresholds sth = {
+  CUR_WARN_A,
+  CUR_LIMP_A,
+  TEMP_WARN_C,
+  TEMP_LIMP_C
+};
+
+SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
+
+updateSafetyStability(
+  rawSafety,
+  now,
+  autoReverseCount,
+  autoReverseActive,
+  lastDriveEvent
+);
+
 
   // ==================================================
   // SYSTEM STATE UPDATE
@@ -1968,3 +1989,4 @@ LOOP_FAULT_EXIT:
   wdCommsOK = wdSensorOK = wdDriveOK = wdBladeOK = true;
   return;
 }
+
