@@ -80,11 +80,11 @@ constexpr uint8_t CH_RESET = 7;
 constexpr uint8_t CH_STARTER = 10;
 
 // ===== Time Budget (ms) =====
-#define BUDGET_SENSORS_MS 30
+#define BUDGET_SENSORS_MS 5
 #define BUDGET_COMMS_MS 3
 #define BUDGET_DRIVE_MS 2
 #define BUDGET_BLADE_MS 2
-#define BUDGET_LOOP_MS 40
+#define BUDGET_LOOP_MS 20
 
 // ============================================================================
 // FUNCTION PROTOTYPES (FINAL / MATCH ARDUINO ABI)
@@ -130,6 +130,15 @@ constexpr int16_t CUR_TRIP_A_CH[4] = {
   90    // R2
 };
 
+// ==================================================
+// ADS1115 ASYNC CURRENT STATE
+// ==================================================
+struct ADSAsyncCurrentState {
+  uint8_t channelIndex;
+  bool conversionRunning;
+};
+
+ADSAsyncCurrentState adsAsync = {0, false};
 // ============================================================================
 // ENGINE VOLTAGE DETECTION
 // ============================================================================
@@ -1055,8 +1064,105 @@ void checkI2CBus(uint32_t now) {
   }
 }
 
-void updateSensors() {
+void updateCurrentAsync(uint32_t now)
+{
+  static float lastCurA[4] = {0};
+  static uint8_t stuckCnt[4] = {0};
 
+  // --------------------------------------------------
+  // START CONVERSION
+  // --------------------------------------------------
+  if (!adsAsync.conversionRunning)
+  {
+    uint16_t mux =
+      ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
+      (ADS_CUR_CH_MAP[adsAsync.channelIndex] << 12);
+
+    adsCur.startADCReading(mux, false);
+    adsAsync.conversionRunning = true;
+    return;
+  }
+
+  // --------------------------------------------------
+  // WAIT UNTIL READY
+  // --------------------------------------------------
+  if (!adsCur.conversionComplete())
+    return;
+
+  // --------------------------------------------------
+  // READ RESULT
+  // --------------------------------------------------
+  int16_t raw = adsCur.getLastConversionResults();
+
+  float v = raw * ADS1115_LSB_V;
+  float offsetV = g_acsOffsetV[adsAsync.channelIndex];
+  float a = (v - offsetV) / ACS_SENS_V_PER_A;
+
+  // plausibility
+  if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE)
+  {
+    latchFault(FaultCode::CUR_SENSOR_FAULT);
+    return;
+  }
+
+  // LPF
+  curA[adsAsync.channelIndex] +=
+    CUR_LPF_ALPHA * (a - curA[adsAsync.channelIndex]);
+
+  // stuck detect
+  if (abs(curL) > 200 || abs(curR) > 200)
+  {
+    if (fabs(curA[adsAsync.channelIndex] -
+             lastCurA[adsAsync.channelIndex]) < 0.03f)
+    {
+      if (++stuckCnt[adsAsync.channelIndex] > 40)
+      {
+        latchFault(FaultCode::CUR_SENSOR_FAULT);
+        return;
+      }
+    }
+    else
+    {
+      stuckCnt[adsAsync.channelIndex] = 0;
+    }
+  }
+
+  lastCurA[adsAsync.channelIndex] =
+    curA[adsAsync.channelIndex];
+
+  // spike protect
+  if (a > CUR_SPIKE_A)
+  {
+    forceDriveSoftStop(now);
+    bladeState = BladeState::SOFT_STOP;
+  }
+
+  // overcurrent latch
+  if (a > CUR_TRIP_A_CH[adsAsync.channelIndex])
+  {
+    if (++overCurCnt[adsAsync.channelIndex] >= 2)
+    {
+      latchFault(FaultCode::OVER_CURRENT);
+      return;
+    }
+  }
+  else
+  {
+    overCurCnt[adsAsync.channelIndex] = 0;
+  }
+
+  // --------------------------------------------------
+  // NEXT CHANNEL
+  // --------------------------------------------------
+  adsAsync.channelIndex++;
+  if (adsAsync.channelIndex >= 4)
+    adsAsync.channelIndex = 0;
+
+  adsAsync.conversionRunning = false;
+}
+
+void updateSensors()
+{
   uint32_t now = millis();
 
 #if TEST_MODE
@@ -1075,36 +1181,34 @@ void updateSensors() {
     static uint8_t resetCount = 0;
     static uint32_t lastResetMs = 0;
 
-    if (Wire.getWireTimeoutFlag()) {
-
+    if (Wire.getWireTimeoutFlag())
+    {
       Wire.clearWireTimeoutFlag();
 
-      if (now - lastResetMs > 3000) {
+      if (now - lastResetMs > 3000)
         resetCount = 0;
-      }
 
-      if (resetCount < 3) {
-
+      if (resetCount < 3)
+      {
         Wire.end();
         delayMicroseconds(200);
         Wire.begin();
         Wire.setClock(100000);
         Wire.setWireTimeout(6000, true);
 
-        // re-init ADS1115 ทั้งสองตัว
         adsCur.begin(0x48);
         adsCur.setGain(GAIN_ONE);
+        adsCur.setDataRate(RATE_ADS1115_860SPS);
 
         adsVolt.begin(0x49);
         adsVolt.setGain(GAIN_ONE);
+        adsVolt.setDataRate(RATE_ADS1115_860SPS);
 
         lastResetMs = now;
         resetCount++;
-
-#if DEBUG_SERIAL
-        Serial.println(F("[I2C] BUS RESET"));
-#endif
-      } else {
+      }
+      else
+      {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
         return;
       }
@@ -1112,70 +1216,145 @@ void updateSensors() {
   }
 
   // ==================================================
-  // HARDWARE OVERCURRENT TRIP (µs-level)
+  // HARDWARE OVERCURRENT
   // ==================================================
-  if (digitalRead(PIN_CUR_TRIP) == LOW) {
+  if (digitalRead(PIN_CUR_TRIP) == LOW)
+  {
     latchFault(FaultCode::OVER_CURRENT);
     return;
   }
 
   // ==================================================
-  // CURRENT (ADS1115) — EVERY LOOP
+  // ASYNC CURRENT (1 channel per loop)
   // ==================================================
-  static float lastCurA[4] = { 0 };
-  static uint8_t stuckCnt[4] = { 0 };
+  static uint8_t curIdx = 0;
+  static bool curConvRunning = false;
+  static float lastCurA[4] = {0};
+  static uint8_t stuckCnt[4] = {0};
 
-  for (uint8_t idx = 0; idx < 4; idx++) {
+  if (!curConvRunning)
+  {
+    uint16_t mux =
+      ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
+      (ADS_CUR_CH_MAP[curIdx] << 12);
 
-    uint8_t adsCh = ADS_CUR_CH_MAP[idx];
-    float a = readCurrentADC(adsCh, idx);
+    adsCur.startADCReading(mux, false);
+    curConvRunning = true;
+  }
+  else if (adsCur.conversionComplete())
+  {
+    int16_t raw = adsCur.getLastConversionResults();
 
-    if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE) {
+    float v = raw * ADS1115_LSB_V;
+    float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
+
+    if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE)
+    {
       latchFault(FaultCode::CUR_SENSOR_FAULT);
       return;
     }
 
-    curA[idx] += CUR_LPF_ALPHA * (a - curA[idx]);
+    curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
 
-    if (abs(curL) > 200 || abs(curR) > 200) {
-      if (fabs(curA[idx] - lastCurA[idx]) < 0.03f) {
-        if (++stuckCnt[idx] > 40) {
+    if (abs(curL) > 200 || abs(curR) > 200)
+    {
+      if (fabs(curA[curIdx] - lastCurA[curIdx]) < 0.03f)
+      {
+        if (++stuckCnt[curIdx] > 40)
+        {
           latchFault(FaultCode::CUR_SENSOR_FAULT);
           return;
         }
-      } else {
-        stuckCnt[idx] = 0;
+      }
+      else
+      {
+        stuckCnt[curIdx] = 0;
       }
     }
 
-    lastCurA[idx] = curA[idx];
+    lastCurA[curIdx] = curA[curIdx];
 
-    if (a > CUR_SPIKE_A) {
+    if (a > CUR_SPIKE_A)
+    {
       forceDriveSoftStop(now);
       bladeState = BladeState::SOFT_STOP;
     }
 
-    if (a > CUR_TRIP_A_CH[idx]) {
-      if (++overCurCnt[idx] >= 2) {
+    if (a > CUR_TRIP_A_CH[curIdx])
+    {
+      if (++overCurCnt[curIdx] >= 2)
+      {
         latchFault(FaultCode::OVER_CURRENT);
         return;
       }
-    } else {
-      overCurCnt[idx] = 0;
     }
+    else
+    {
+      overCurCnt[curIdx] = 0;
+    }
+
+    curIdx++;
+    if (curIdx >= 4)
+      curIdx = 0;
+
+    curConvRunning = false;
   }
 
   // ==================================================
-  // TEMPERATURE (PT100) — 100 ms RATE
+  // ASYNC VOLTAGE (1 sample / 50ms window)
+  // ==================================================
+  static bool voltConvRunning = false;
+  static uint32_t lastVoltTrigger_ms = 0;
+  static uint32_t lastVoltOk_ms = 0;
+
+  constexpr uint8_t ADS_VOLT_CH = 0;
+  constexpr float DIV_RATIO = (150.0f + 33.0f) / 33.0f;
+
+  if (!voltConvRunning && (now - lastVoltTrigger_ms >= 50))
+  {
+    uint16_t mux =
+      ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
+      (ADS_VOLT_CH << 12);
+
+    adsVolt.startADCReading(mux, false);
+    voltConvRunning = true;
+    lastVoltTrigger_ms = now;
+  }
+  else if (voltConvRunning && adsVolt.conversionComplete())
+  {
+    int16_t raw = adsVolt.getLastConversionResults();
+
+    float v_adc = raw * ADS1115_LSB_V;
+    float vRaw = v_adc * DIV_RATIO;
+
+    if (vRaw > 0.0f && vRaw < 40.0f)
+    {
+      engineVolt += 0.15f * (vRaw - engineVolt);
+      lastVoltOk_ms = now;
+    }
+
+    voltConvRunning = false;
+  }
+
+  if (now - lastVoltOk_ms > 500)
+  {
+    latchFault(FaultCode::VOLT_SENSOR_FAULT);
+    return;
+  }
+
+  // ==================================================
+  // TEMPERATURE (100ms)
   // ==================================================
   static uint32_t lastTemp_ms = 0;
   static uint32_t lastTempOk_ms = 0;
 
-  if (now - lastTemp_ms >= 100) {
+  if (now - lastTemp_ms >= 100)
+  {
     lastTemp_ms = now;
 
     int16_t tL, tR;
-    if (!readDriverTempsPT100(tL, tR)) {
+    if (!readDriverTempsPT100(tL, tR))
+    {
       latchFault(FaultCode::TEMP_SENSOR_FAULT);
       return;
     }
@@ -1184,41 +1363,19 @@ void updateSensors() {
     tempDriverR = tR;
     lastTempOk_ms = now;
 
-    if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C) {
+    if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C)
+    {
       latchFault(FaultCode::OVER_TEMP);
       return;
     }
   }
 
-  if (now - lastTempOk_ms > 500) {
+  if (now - lastTempOk_ms > 500)
+  {
     latchFault(FaultCode::TEMP_SENSOR_FAULT);
     return;
   }
 
-  // ==================================================
-  // ENGINE VOLTAGE (ADS1115) — 50 ms RATE
-  // ==================================================
-  static uint32_t lastVolt_ms = 0;
-  static uint32_t lastVoltOk_ms = 0;
-
-  if (now - lastVolt_ms >= 50) {
-    lastVolt_ms = now;
-
-    float v;
-    if (readEngineVoltageADS1115(v)) {
-      engineVolt += 0.15f * (v - engineVolt);
-      lastVoltOk_ms = now;
-    }
-  }
-
-  if (now - lastVoltOk_ms > 500) {
-    latchFault(FaultCode::VOLT_SENSOR_FAULT);
-    return;
-  }
-
-  // ==================================================
-  // SENSOR PATH OK
-  // ==================================================
   wdSensorOK = true;
 }
 
