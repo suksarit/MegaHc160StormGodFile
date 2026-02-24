@@ -276,6 +276,263 @@ CSV Telemetry:
 - รีโมทขาดจะเข้าสู่ EMERGENCY ทันที
 - ถ้า External Watchdog ไม่เห็น Heartbeat จะตัดระบบ
 
+เอธิบายภาพรวมความสามารถเชิงเทคนิค โครงสร้างการทำงาน
+ประสิทธิภาพด้านเวลา (Timing), ระบบความปลอดภัย และขอบเขตการทำงาน
+ของโค้ดทั้งหมดในโปรเจค MegaHc160Storm32
+
+=====================================================================
+1) วัตถุประสงค์ของระบบ
+=====================================================================
+
+ระบบนี้ออกแบบมาเพื่อควบคุมรถตัดหญ้าแบบบังคับวิทยุ
+โดยเน้นความปลอดภัย (Safety-Centric Design) เป็นหลัก
+
+หลักการออกแบบ:
+- Fail-Safe First
+- Hardware + Software Redundancy
+- Deterministic Loop Timing
+- Non-Blocking Architecture
+- Fault Latching (ไม่กลับสู่ปกติเอง)
+
+=====================================================================
+2) โครงสร้างสถาปัตยกรรมของระบบ
+=====================================================================
+
+ระบบแบ่งการทำงานออกเป็น 5 ส่วนหลัก:
+
+1. Communication Layer
+2. Sensor Layer
+3. Safety Layer
+4. Drive & Blade Control Layer
+5. Auxiliary & Gimbal Layer
+
+ลำดับการทำงานใน loop():
+
+PHASE 1: COMMS
+PHASE 2: SENSORS
+PHASE 3: SAFETY EVALUATION
+PHASE 4: DRIVE & BLADE
+PHASE 5: AUXILIARY OUTPUT
+HEARTBEAT (ถ้าไม่มี Fault)
+
+โครงสร้างนี้ทำให้การทำงานมีความแน่นอนและตรวจจับความผิดปกติได้ชัดเจน
+
+=====================================================================
+3) ความสามารถของระบบขับเคลื่อน (Drive System)
+=====================================================================
+
+3.1 PWM ความถี่สูง 15kHz
+- ลดเสียงรบกวนจากมอเตอร์
+- ลด Ripple
+- ควบคุมแรงบิดละเอียด
+
+3.2 Hybrid Steering Algorithm
+- ความเร็วต่ำ: Arcade Mode (หมุนในที่แคบ)
+- ความเร็วสูง: Differential Mode (นิ่งเสถียร)
+- มี Blend Factor ตามความเร็ว
+
+3.3 Deadband Control
+- ป้องกันคันเร่งสั่น
+- ป้องกัน Drift
+
+3.4 Ramp Control
+- เร่งและเบรกแบบนุ่มนวล
+- ลดกระแสกระชาก
+
+3.5 Reverse Dead-Time (150ms)
+- ป้องกัน Shoot-through
+- ป้องกัน H-Bridge เสียหาย
+
+3.6 Auto Reverse (Stuck Recovery)
+- ถ้าล้อข้างใดกระแสสูงผิดปกติ
+- ถอยหลังสั้น ๆ อัตโนมัติ
+- จำกัดจำนวนครั้ง
+- มี Cooldown
+
+3.7 LIMP Mode
+- ลดกำลัง 50%
+- ใช้เมื่อโหลดสูงหรืออุณหภูมิสูง
+
+3.8 Soft Stop
+- ลด PWM ก่อนเข้าสู่ LOCKED
+- ลดแรงกระชากเชิงกล
+
+=====================================================================
+4) ระบบตรวจวัด (Sensor Capabilities)
+=====================================================================
+
+4.1 Current Monitoring (4 Channels)
+- อ่านผ่าน ADS1115 (860 SPS)
+- LPF Filtering
+- Plausibility Check
+- Spike Protection
+- Overcurrent Confirm 2 ครั้งก่อน Fault
+
+4.2 Voltage Monitoring
+- Divider 150k/33k
+- Smoothing Filter
+- Engine Running Detection
+- Voltage Warning 2 ระดับ
+
+4.3 Temperature Monitoring
+- PT100 + MAX31865
+- ตรวจจับ Sensor Fault
+- Warn / Limp / Trip Threshold
+
+4.4 I2C Recovery State Machine
+- ตรวจจับ Timeout
+- Reset Bus แบบ Non-blocking
+- จำกัดจำนวนครั้ง
+- Fault หากกู้ไม่สำเร็จ
+
+=====================================================================
+5) ระบบความปลอดภัย (Safety System)
+=====================================================================
+
+5.1 SafetyState
+SAFE
+WARN
+LIMP
+EMERGENCY
+
+5.2 Fault Types
+- IBUS_LOST
+- COMMS_TIMEOUT
+- LOGIC_WATCHDOG
+- CUR_SENSOR_FAULT
+- VOLT_SENSOR_FAULT
+- TEMP_SENSOR_FAULT
+- OVER_CURRENT
+- OVER_TEMP
+- DRIVE_TIMEOUT
+- BLADE_TIMEOUT
+- LOOP_OVERRUN
+
+5.3 Hardware Overcurrent (PIN 32)
+- Active LOW
+- ตัดทันทีโดยไม่ต้องรอ I2C
+
+5.4 Fault Latching
+- เมื่อ Fault แล้วจะไม่กลับเอง
+- ต้อง Reset ระบบ
+
+5.5 Heartbeat Logic
+- ส่งสัญญาณเฉพาะเมื่อ Loop สำเร็จ
+- Fault → ไม่ส่ง Heartbeat
+
+=====================================================================
+6) ประสิทธิภาพด้านเวลา (Timing Performance)
+=====================================================================
+
+กำหนด Budget ชัดเจน:
+
+Sensors   ≤ 5 ms
+Comms     ≤ 3 ms
+Drive     ≤ 2 ms
+Blade     ≤ 2 ms
+Loop รวม  ≤ 20 ms
+
+หากเกิน Budget:
+- Trigger Fault ทันที
+
+ลักษณะการออกแบบ:
+- ไม่มี delay()
+- ใช้ millis() / micros()
+- Non-blocking State Machine
+
+Worst-case loop ≈ <20ms
+อัตรารีเฟรชควบคุม ~50Hz
+
+=====================================================================
+7) ระบบควบคุมใบมีด / เครื่องยนต์
+=====================================================================
+
+BladeState:
+IDLE
+RUN
+SOFT_STOP
+LOCKED
+
+Engine:
+- ตรวจจับการติดเครื่องจากแรงดัน
+- Starter Timeout
+- Restart Guard
+- Throttle Kill เมื่อ Fault
+
+=====================================================================
+8) Storm32 Gimbal Controller
+=====================================================================
+
+- Binary Protocol
+- CRC16 Verification
+- Dual Phase Window (Control / Comm)
+- Ack Timeout 3 ระดับ
+- Emergency Lock
+- Slew Rate จำกัดความเร็วการหมุน
+- EEPROM Configurable
+
+State:
+INIT
+OK
+DEGRADED
+LOST
+EMERGENCY
+
+=====================================================================
+9) ความเสถียรเชิงระบบ (System Robustness)
+=====================================================================
+
+- Dual Layer Overcurrent (Software + Hardware)
+- Sensor Plausibility Guard
+- Stuck Detection
+- Loop Overrun Detection
+- Watchdog ทั้งภายใน MCU และภายนอก
+- Driver Enable Hardware Gate
+- Soft Stop แทนการตัดทันที
+
+=====================================================================
+10) ความสามารถในการ Debug
+=====================================================================
+
+DEBUG_SERIAL = 1
+แสดง:
+- SystemState
+- DriveState
+- BladeState
+- Current 4 ช่อง
+- Temp L/R
+- PWM L/R
+- Voltage
+- IBUS Raw
+
+TELEMETRY_CSV = 1
+- ส่งข้อมูลทุก 50ms
+- เหมาะกับการ Plot วิเคราะห์ภาคสนาม
+
+=====================================================================
+11) ข้อจำกัดของระบบ
+=====================================================================
+
+- เป็นระบบควบคุมแบบ Manual RC (ไม่ใช่ Autonomous)
+- ไม่มี Closed-loop Speed Control
+- ไม่มี Encoder Feedback
+- ไม่ใช่ระบบ SIL-certified
+- ประสิทธิภาพขึ้นกับคุณภาพฮาร์ดแวร์ภายนอก
+
+=====================================================================
+12) สรุปความสามารถโดยรวม
+=====================================================================
+
+ระบบนี้เป็น:
+- Safety-oriented Control System
+- Deterministic Timing Architecture
+- Multi-layer Fault Detection
+- Field-ready High Current Platform
+- มีระบบ Fail-Safe ครบถ้วน
+
+ออกแบบเพื่อใช้งานภาคสนามจริง
+ภายใต้สภาพแวดล้อมที่มี EMI และโหลดสูง
+
 =====================================================================
 จบเอกสาร
 =====================================================================
