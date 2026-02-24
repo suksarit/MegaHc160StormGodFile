@@ -39,11 +39,11 @@ Mega2560 + FlySky iBUS + HC160AS2 + Storm32BGC
 
 1. Arduino Mega2560 (ตัวควบคุมหลัก)
 2. รีโมท FlySky i6X + รีซีฟเวอร์ FS-iA6B (รองรับ iBUS)
-3. มอเตอร์ขับเคลื่อน 24V x 2 ตัว
+3. มอเตอร์ขับเคลื่อน 24V x 2 ตัว : บอร์ดไดรว์ / ข้าง
 4. ไดรเวอร์มอเตอร์กระแสสูง (เช่น HC160AS2 หรือ H-Bridge 100A)
 5. เครื่องยนต์เบนซิน (ใบมีดขับทางกล)
 6. Servo MG995 หรือเทียบเท่า (ควบคุมคันเร่งเครื่องยนต์)
-7. ADS1115 x2 ตัว
+7. ADS1115 x2 ตัว : บอร์ดไดรว์ / ข้าง
    - ตัวที่ 1: วัดกระแส (I2C Address 0x48)
    - ตัวที่ 2: วัดแรงดัน (I2C Address 0x49)
 8. Current Sensor แบบ Hall (เช่น ACS758)
@@ -54,7 +54,7 @@ Mega2560 + FlySky iBUS + HC160AS2 + Storm32BGC
     - Warning
 11. Comparator Hardware Overcurrent (เอาต์พุต Open-Collector)
 12. External Watchdog Module
-13. พัดลม 24V x2
+13. พัดลม 24V x2 : บอร์ดไดรว์  
 14. แบตเตอรี่ 24V (24–28V)
 15. DC-DC Step-down 24V → 5V (แยกสำหรับ MCU)
 16. ฟิวส์กำลังสูง
