@@ -599,19 +599,154 @@ Fault Latch บ่อย = ระบบกำลังชน Threshold ซ้ำ
 ส่วนที่ 4 : สรุป 
 =====================================================================
 
-ถ้า Latch บ่อย:
-
-ประมาณ 80% มาจาก
+ถ้า Latch บ่อย:ประมาณ 80% มาจาก
 - โหลดกลเกิน
 - EMI สูง
 - สายกราวด์ไม่ดี
-- Comparator ไวเกิน
-
+- Comparator ไวเกิน 
 ไม่ใช่บั๊กโค้ดเสมอไป
-
 Fault Latch คือระบบป้องกัน
 ถ้ามันทำงานบ่อย แปลว่ามีบางอย่าง “ไม่ปกติจริง”
 
 =====================================================================
-จบ 
+
 =====================================================================
+
+
+
+==============================================
+SENSOR MEASUREMENT PROCESS SUMMARY
+==============================================
+
+1) การวัดแรงดันระบบ 24V (Engine / Battery Voltage)
+----------------------------------------------------
+ฮาร์ดแวร์:
+- ADS1115 ตัวที่ 2 (I2C address 0x49)
+- GAIN_ONE (±4.096V)
+- DataRate = 860 SPS
+- ตัวแบ่งแรงดัน 150k / 33k
+
+ขั้นตอนทำงาน:
+
+[1] Trigger การแปลงค่าแบบ async ทุก ~50ms
+    adsVolt.startADCReading(...)
+
+[2] อ่านค่า raw 16-bit เมื่อ conversionComplete()
+
+[3] แปลงเป็นโวลต์ที่ขา ADC:
+    v_adc = raw * (4.096 / 32768)
+
+[4] คูณอัตราส่วน divider:
+    Vsystem = v_adc * ((150 + 33) / 33)
+
+[5] กรองสัญญาณ:
+    - LPF (engineVolt += 0.15*(vRaw-engineVolt))
+    - reject ถ้าเกินช่วง 0–40V
+    - timeout > 500ms → VOLT_SENSOR_FAULT
+
+นำไปใช้:
+- ตรวจเครื่องยนต์ติด (>= 27.2V)
+- ตรวจเครื่องดับ (<= 25.5V)
+- เตือนแรงดันต่ำ 24.0V
+- เตือนวิกฤต 23.0V
+- บล็อกเข้าสู่ ACTIVE ถ้าไฟไม่พอ
+
+2) การวัดกระแสมอเตอร์ (Motor Current)
+---------------------------------------
+
+ฮาร์ดแวร์:
+- ACS current sensor 4 ช่อง
+- ADS1115 ตัวที่ 1 (I2C address 0x48)
+- GAIN_ONE (±4.096V)
+- DataRate = 860 SPS
+- Sensitivity = 40mV/A
+- Offset เริ่มต้น ~2.5V
+
+Channel Mapping:
+0 = L1
+1 = L2
+2 = R1
+3 = R2
+
+ขั้นตอนทำงาน (Async 1 ช่องต่อ 1 loop):
+
+[1] startADCReading(channel)
+
+[2] เมื่อ conversionComplete():
+    raw = getLastConversionResults()
+
+[3] แปลงเป็นโวลต์:
+    v = raw * (4.096 / 32768)
+
+[4] แปลงเป็นแอมป์:
+    A = (v - offsetV) / 0.04
+
+[5] Plausibility guard:
+    -10A ถึง 150A เท่านั้น
+
+[6] Low-pass filter:
+    curA[i] += 0.12*(A - curA[i])
+
+[7] Protection:
+    - spike > 120A → soft stop
+    - เกิน threshold ช่องนั้น 2 ครั้งติด → OVER_CURRENT
+    - sensor ค้าง → CUR_SENSOR_FAULT
+
+การรวมกระแส:
+    Left  = L1 + L2
+    Right = R1 + R2
+
+นำไปใช้:
+- SafetyState SAFE/WARN/LIMP/EMERGENCY
+- ตรวจล้อติด
+- auto reverse
+- cut drive ทันทีเมื่อเกินหนัก
+
+
+3) การวัดอุณหภูมิไดรเวอร์ (Driver Temperature)
+------------------------------------------------
+ฮาร์ดแวร์:
+- MAX31865 x 2
+- PT100 แบบ 3-wire
+- CS = 49 (Left), 48 (Right)
+- Rref = 430Ω
+- Rnominal = 100Ω
+
+ขั้นตอนทำงาน:
+
+[1] อ่าน fault bit ก่อน:
+    readFault()
+    ถ้ามี fault → clearFault() → TEMP_SENSOR_FAULT
+
+[2] อ่านอุณหภูมิ:
+    temperature(RNOMINAL, RREF)
+
+[3] Plausibility:
+    -40°C ถึง 200°C เท่านั้น
+
+[4] อ่านทุก ~100ms
+
+[5] ถ้าเกิน:
+    WARN  > 70°C
+    LIMP  > 85°C
+    TRIP  > 95°C → OVER_TEMP
+
+[6] timeout > 500ms → TEMP_SENSOR_FAULT
+
+
+==============================================
+ภาพรวมการทำงานทั้งระบบ
+==============================================
+แรงดัน → ใช้กำหนด state machine และป้องกันไฟต่ำ  
+กระแส → ใช้ควบคุมความปลอดภัยมอเตอร์โดยตรง  
+อุณหภูมิ → ใช้ป้องกันไดรเวอร์ไหม้  
+
+ทั้งสามตัวถูกอ่านแบบ non-blocking
+มี timeout guard
+มี plausibility guard
+มี latch fault
+มี soft stop ก่อน cut จริง
+
+==============================================
+จบ
+==============================================
