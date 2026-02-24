@@ -1,272 +1,316 @@
-=====================================================================
-คู่มือระบบควบคุมรถตัดหญ้า
-MegaHc160Storm32
-Arduino Mega2560 + FlySky iBUS + HC160AS2 + Storm32BGC
-=====================================================================
+====================================================================
+คู่มือระบบรถบังคับตัดหญ้า
+Mega2560 + FlySky iBUS + HC160AS2 + Storm32BGC
+TN MOWER – TECHNICAL & FIELD MANUAL
+====================================================================
 
-เอกสารนี้อธิบาย:
-• ฟีเจอร์ทั้งหมดของระบบ
-• การเชื่อมต่อขาพิน
-• หน้าที่ของช่องสัญญาณรีโมท
-• การตั้งค่าที่สำคัญในโค้ด
-• ลำดับการทำงานของระบบทั้งหมด
-สามารถคัดลอกไปใช้งานได้ทันที
+เนื้อหา:
+1) รายการอุปกรณ์ทั้งหมด
+2) โครงสร้างการทำงานของโค้ด
+3) ฟังก์ชันและฟีเจอร์หลัก
+4) ผังขาพินทั้งหมด
+5) หน้าที่ช่องสัญญาณรีโมท
+6) ขั้นตอนการใช้งาน
+7) การตั้งค่าในโค้ด
+8) การคาลิเบรต
+9) การตั้งค่ารีโมทและรีซีฟเวอร์
+10) แนวทางป้องกัน Back EMF และ EMI
+11) จุดสำคัญที่ต้องคำนึง
+12) Serial Monitor และ Debug
+13) ข้อควรระวังภาคสนาม
 
-=====================================================================
-1) ภาพรวมสถาปัตยกรรมระบบ
-=====================================================================
+====================================================================
+1) รายการอุปกรณ์ทั้งหมด
+====================================================================
 
-MCU หลัก: Arduino Mega2560
-
-ระบบแบ่งเป็น 5 ส่วนหลัก:
-
-1. ระบบขับเคลื่อน (Drive System)
-2. ระบบเครื่องยนต์ / ใบมีด (Engine & Blade)
-3. ระบบเซ็นเซอร์ (Current / Voltage / Temp)
-4. ระบบความปลอดภัย (Safety Manager + Fault Latch)
-5. ระบบกิมบอล Storm32
-
-การทำงานเป็น State Machine ทั้งระบบ
-
-SystemState:
-INIT → WAIT_NEUTRAL → ACTIVE → FAULT
-
-DriveState:
-IDLE → RUN → LIMP → SOFT_STOP → LOCKED
-
-BladeState:
-IDLE → RUN → SOFT_STOP → LOCKED
-
-=====================================================================
-2) ฟีเจอร์หลักของระบบ
-=====================================================================
+ไมโครคอนโทรลเลอร์
+• Arduino Mega2560
 
 ระบบขับเคลื่อน
-• PWM 15kHz (Timer3 / Timer4)
-• Hybrid Mixing (Arcade + Differential)
-• Deadband throttle 1450–1550
-• Ramp Acceleration / Deceleration
-• Reverse Dead-Time 150ms
-• Auto Reverse (จำกัด 2 ครั้ง)
-• LIMP Mode ลดกำลัง 50%
-• Soft Stop ก่อนเข้าสู่ LOCKED
-• Driver Enable (ฮาร์ดตัดกำลังจริง)
+• มอเตอร์ซ้าย 1 ชุด
+• มอเตอร์ขวา 1 ชุด
+• Driver H-Bridge กำลังสูง (100A class)
+• Comparator วงจร Hardware Overcurrent (Active LOW)
 
-ระบบเซ็นเซอร์
-• วัดกระแส 4 ช่องผ่าน ADS1115
-• LPF กระแส (alpha = 0.12)
-• Overcurrent Confirm 2 ครั้ง
-• Current Spike >120A → Soft Stop
-• วัดแรงดันระบบผ่าน ADS1115 แยกตัว
-• Median Filter + LPF
-• วัดอุณหภูมิ PT100 ผ่าน MAX31865
-• Plausibility guard ทุกเซ็นเซอร์
-• I2C Recovery State Machine
+เซ็นเซอร์
+• ADS1115 (กระแส) I2C address 0x48
+• ADS1115 (แรงดัน) I2C address 0x49
+• MAX31865 x2 (PT100 ซ้าย/ขวา)
+• PT100 x2 (วัดอุณหภูมิไดรเวอร์)
 
-ระบบความปลอดภัย
-• IBUS Soft timeout 100ms
-• IBUS Hard timeout 300ms → FAULT
-• Hardware Overcurrent (Pin 32)
-• Logic Watchdog 500ms
-• Loop Budget Guard
-• EEPROM บันทึก Fault ล่าสุด
-• FAULT → Immediate Cut + ไม่มี Heartbeat
+ระบบเครื่องยนต์
+• Servo คันเร่ง (MG995 หรือเทียบเท่า)
+• Relay Ignition
+• Relay Starter
 
-Storm32 Gimbal
-• Binary Protocol
-• CRC16 ตรวจสอบข้อมูล
-• Dual Phase Scheduler
-• Ack Watchdog 3 ระดับ
-• INIT / OK / DEGRADED / LOST / EMERGENCY
+รีโมท
+• FlySky i6X (หรือเทียบเท่า)
+• Receiver FS-iA6B (iBUS mode)
 
-=====================================================================
-3) ผังขาพินทั้งหมด (Hardware Pin Map)
-=====================================================================
+ระบบเสริม
+• Storm32 BGC Gimbal
+• External Watchdog (รับ heartbeat จาก Pin 34)
+• พัดลมระบายความร้อน 2 ตัว
 
------ มอเตอร์ขับเคลื่อน -----
-PWM_L        → Pin 5
-PWM_R        → Pin 6
-DIR_L1       → Pin 22
-DIR_L2       → Pin 23
-DIR_R1       → Pin 24
-DIR_R2       → Pin 25
-Driver Enable→ Pin 33
+ไฟเลี้ยง
+• แบตเตอรี่ 24–28V
+• DC-DC 24V → 12V
+• DC-DC 12V → 5V (isolated แนะนำ)
 
------ พัดลม -----
-FAN_L        → Pin 44
-FAN_R        → Pin 45
+====================================================================
+2) โครงสร้างการทำงานของโค้ด
+====================================================================
 
------ รีเลย์ / เอาต์พุต -----
-Ignition Relay → Pin 28
-Starter Relay  → Pin 29
-Buzzer         → Pin 30
-Warning Relay  → Pin 31
-HW Overcurrent → Pin 32 (INPUT_PULLUP)
+Loop หลักแบ่งเป็น Phase:
 
------ Watchdog -----
-External WD Heartbeat → Pin 34
+PHASE 1: COMMS
+• อ่าน iBUS
+• ตรวจ timeout
+• ตั้ง wdCommsOK
 
------ Servo -----
-Engine Throttle Servo → Pin 9
+PHASE 2: SENSORS
+• อ่านกระแสแบบ async
+• อ่านแรงดันแบบ async
+• อ่านอุณหภูมิทุก 100ms
+• ตรวจ plausibility
+• ตรวจ Overcurrent / Overtemp
 
------ PT100 -----
-MAX31865 CS Left  → Pin 49
-MAX31865 CS Right → Pin 48
+PHASE 3: SAFETY
+• evaluateSafetyRaw()
+• updateSafetyStability()
 
------ ADS1115 -----
-Current ADC  → I2C Address 0x48
-Voltage ADC  → I2C Address 0x49
+PHASE 4: STATE MACHINE
+• INIT
+• WAIT_NEUTRAL
+• ACTIVE
+• FAULT
 
------ Serial -----
-Serial1 → FlySky iBUS
+PHASE 5: DRIVE / BLADE
+• runDrive()
+• runBlade()
+• applyDrive()
+
+PHASE 6: AUX
+• updateVoltageWarning()
+• updateDriverFans()
+• updateEngineThrottle()
+• updateIgnition()
+• updateStarter()
+• gimbal.update()
+
+ถ้าเกิด Fault:
+• handleFaultImmediateCut()
+• ไม่มี Heartbeat
+
+====================================================================
+3) ฟีเจอร์หลัก
+====================================================================
+
+ระบบขับเคลื่อน
+• PWM 15kHz (Timer3/4)
+• Hybrid Mixing
+• Deadband 1450–1550
+• Ramp acceleration
+• Reverse dead-time 150ms
+• Auto reverse 2 ครั้ง
+• LIMP mode
+• SOFT_STOP → LOCKED
+
+ระบบป้องกัน
+• IBUS soft + hard timeout
+• Hardware overcurrent trip (Pin 32)
+• Spike protection >120A
+• Current stuck detect
+• Voltage timeout detect
+• Temperature trip >95°C
+• Loop budget monitor
+• EEPROM fault history
+
+====================================================================
+4) ผังขาพิน
+====================================================================
+
+Motor
+PWM_L  → 5
+PWM_R  → 6
+DIR_L1 → 22
+DIR_L2 → 23
+DIR_R1 → 24
+DIR_R2 → 25
+Driver Enable → 33
+
+Fan
+FAN_L → 44
+FAN_R → 45
+
+Relay
+IGNITION → 28
+STARTER  → 29
+BUZZER   → 30
+WARN     → 31
+HW Overcurrent → 32 (INPUT_PULLUP)
+
+Watchdog
+Heartbeat → 34
+
+Temp Sensor
+PT100 L CS → 49
+PT100 R CS → 48
+
+Servo
+Engine Servo → 9
+
+Serial
+Serial1 → iBUS
 Serial2 → Storm32
 Serial  → Debug
 
-=====================================================================
-4) หน้าที่ช่องสัญญาณรีโมท (IBUS Channel Mapping)
-=====================================================================
+====================================================================
+5) ช่องสัญญาณรีโมท
+====================================================================
 
-CH1  → เลี้ยวซ้าย–ขวา
-CH2  → เดินหน้า–ถอยหลัง
-CH6  → เปิด/ปิด Ignition
-CH7  → Reset
-CH8  → ควบคุมรอบเครื่องยนต์ (Servo)
+CH1 → Steering
+CH2 → Throttle
+CH6 → Ignition
+CH7 → Reset
+CH8 → Engine throttle
 CH10 → Starter
 
-Storm32:
+Storm32
 CH3 → Pitch
 CH9 → Yaw
 
-Throttle (CH2):
-1000–1450  = ถอยหลัง
-1450–1550  = Deadband
-1550–2000  = เดินหน้า
+Throttle mapping:
+1000–1450  = Reverse
+1450–1550  = Neutral
+1550–2000  = Forward
 
-Steering (CH1):
-1000–1450  = ซ้าย
-1450–1550  = ตรง
-1550–2000  = ขวา
+====================================================================
+6) ขั้นตอนการใช้งาน
+====================================================================
 
-=====================================================================
-5) การตั้งค่าที่สำคัญในโค้ด
-=====================================================================
+1) เปิดระบบ
+2) รอ INIT 2 วินาที
+3) ตรวจว่าคันเร่งอยู่กลาง
+4) ระบบเข้าสู่ ACTIVE
+5) เปิด Ignition (CH6)
+6) กด Starter (CH10)
+7) ปรับรอบด้วย CH8
+8) ขับด้วย CH1 + CH2
 
------ Time Budget -----
-BUDGET_SENSORS_MS = 5
-BUDGET_COMMS_MS   = 3
-BUDGET_DRIVE_MS   = 2
-BUDGET_BLADE_MS   = 2
-BUDGET_LOOP_MS    = 20
+====================================================================
+7) การตั้งค่าในโค้ด
+====================================================================
 
-ถ้าเกิน → latchFault()
+Threshold ปรับได้ในส่วน:
 
------ Current Threshold -----
-CUR_WARN_A  = 55A
-CUR_LIMP_A  = 75A
-CUR_SPIKE_A = 120A
-CUR_TRIP_A_CH[] = 90–100A ต่อช่อง
+CUR_WARN_A
+CUR_LIMP_A
+TEMP_WARN_C
+TEMP_LIMP_C
+TEMP_TRIP_C
+V_WARN_LOW
+V_WARN_CRITICAL
 
------ Temperature -----
-TEMP_WARN_C = 70°C
-TEMP_LIMP_C = 85°C
-TEMP_TRIP_C = 95°C
+PWM_TOP = 1067 (15kHz)
 
------ Voltage -----
-V_WARN_LOW      = 24.0V
-V_WARN_CRITICAL = 23.0V
-ENGINE_RUNNING_VOLT = 27.2V
-ENGINE_STOP_VOLT    = 25.5V
+Reverse Deadtime:
+REVERSE_DEADTIME_MS = 150
 
------ Auto Reverse -----
+Auto Reverse:
 MAX_AUTO_REVERSE = 2
-AUTO_REV_MS      = 350ms
-AUTO_REV_COOLDOWN= 1500ms
 
-=====================================================================
-6) ลำดับการทำงานของระบบทั้งหมด
-=====================================================================
+====================================================================
+8) การคาลิเบรต
+====================================================================
 
-1. Boot
-• ตัดมอเตอร์ทั้งหมด
-• ปิด Driver Enable
-• อ่าน Fault ล่าสุดจาก EEPROM
-• เริ่ม Watchdog
+กระแส:
+• ไม่มีโหลด
+• วัดแรงดัน offset
+• ปรับ g_acsOffsetV[i] ให้ใกล้ 2.5V
 
-2. INIT
-• Warmup sensor 2 วินาที
-• ตรวจ PT100
-• ตรวจ IBUS อยู่ในช่วงปกติ
+แรงดัน:
+• วัดด้วยมัลติมิเตอร์
+• เทียบค่า engineVolt
 
-3. WAIT_NEUTRAL
-• รอแรงดัน > 24.5V
-• รอ throttle อยู่กลาง
-• รอรีโมทไม่หลุด
+รีโมท:
+• ตรวจค่า channel 1000–2000
+• ตรวจ deadband
 
-4. ACTIVE
-• เปิด Driver Enable
-• อนุญาต DriveState RUN
-• เริ่มควบคุมใบมีด
+====================================================================
+9) การตั้งค่ารีโมท
+====================================================================
 
-5. Loop ทำงานตาม Phase:
-Phase 1: COMMS
-Phase 2: SENSORS
-Phase 3: DRIVE
-Phase 4: BLADE
-Phase 5: AUX (Fan / Voltage / Starter / Gimbal)
+FlySky:
+• Mode 2
+• เปิด iBUS output
+• Disable mixing
+• Endpoint 100%
+• Subtrim ให้ Neutral = 1500
 
-6. ถ้า Fault เกิด:
-• systemState = FAULT
-• handleFaultImmediateCut()
-• driveSafe()
-• servo = 1000µs
-• ไม่ส่ง Heartbeat
+Receiver:
+• ต่อสาย iBUS ไป RX1
+• ไม่ใช้ PPM
 
-=====================================================================
-7) ระบบแรงดันเตือน
-=====================================================================
+====================================================================
+10) การป้องกัน Back EMF และ EMI
+====================================================================
 
-≥ 24.0V  → ปกติ
-23–24V   → เตือนกระพริบ
-< 23V    → เตือนค้าง
+Back EMF:
+• ใส่ TVS diode ที่ 24V rail
+• ใช้ Driver ที่มี flyback diode
+• ใส่ Snubber RC ที่มอเตอร์
 
-สามารถ mute ได้จนแรงดันกลับปกติ
+EMI:
+• แยกกราวด์ Power กับ Logic
+• ใช้สาย twisted pair
+• Shield สายสัญญาณ
+• ใส่ Ferrite bead ที่สายมอเตอร์
+• DC-DC แบบ isolated
 
-=====================================================================
-8) ระบบ Auto Reverse
-=====================================================================
+Pull-up:
+• PIN 32 ควรมี pull-up 4.7k ภายนอกถ้าสายยาว
 
-เงื่อนไข:
-• ล้อข้างหนึ่งกระแสสูง
-• อีกข้างต่ำ
-• อยู่ใน RUN หรือ LIMP
+====================================================================
+11) จุดสำคัญที่ต้องคำนึง
+====================================================================
 
-จะถอยหลังตรง 350ms
-จำกัด 2 ครั้ง
-รีเซ็ตเมื่อ SAFE stable 2 วินาที
-
-=====================================================================
-9) เงื่อนไขเข้าสู่ FAULT
-=====================================================================
-
-• IBUS หลุดเกิน 300ms
-• Overcurrent ยืนยัน 2 รอบ
-• Temp > 95°C
-• Voltage sensor timeout
-• I2C reset เกิน 3 ครั้ง
-• Loop ใช้เวลานานเกิน budget
-• Hardware Overcurrent LOW ที่ Pin 32
-
-=====================================================================
-10) คำแนะนำการใช้งานภาคสนาม
-=====================================================================
-
-• ตรวจ Neutral ก่อนเปิดระบบ
-• ตรวจแรงดันแบตก่อนทุกครั้ง
-• ตรวจว่าพัดลมหมุนเมื่ออุณหภูมิสูง
-• ตรวจ Starter ทำงานเฉพาะ IDLE
 • ห้าม bypass Driver Enable
-• ถ้า Fault ซ้ำ ต้องตรวจฮาร์ดแวร์
+• ห้าม disable Fault logic
+• ตรวจแรงดันก่อนทุกครั้ง
+• ตรวจพัดลมทำงาน
+• ตรวจสายกราวด์แน่น
+• ตรวจว่า iBUS ไม่หลุด
 
-=====================================================================
-จบคู่มือ
-=====================================================================
+====================================================================
+12) Serial Monitor และ Debug
+====================================================================
+
+เปิด DEBUG_SERIAL = 1
+
+ดูข้อมูล:
+• [TEL] state
+• Current
+• Temperature
+• PWM
+• Voltage
+• IBUS value
+
+Telemetry CSV:
+TELEMETRY_CSV = 1
+ดูผ่าน Serial Plotter
+
+====================================================================
+13) ข้อควรระวัง
+====================================================================
+
+• ห้ามทดสอบในสนามด้วย TEST_MODE
+• ห้ามจ่ายไฟโดยไม่มีโหลดไดรเวอร์
+• ห้ามสตาร์ทเครื่องเมื่อ Throttle ไม่อยู่กลาง
+• หาก Fault เกิดซ้ำ ต้องแก้ฮาร์ดแวร์ก่อนใช้งาน
+• ตรวจสอบ EMI ทุกครั้งหลังประกอบใหม่
+• ห้ามใช้แหล่งจ่ายที่ไม่มีกรอง ripple
+
+====================================================================
+จบเอกสาร
+====================================================================
