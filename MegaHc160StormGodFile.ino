@@ -90,12 +90,10 @@ constexpr uint8_t CH_STARTER = 10;
 // FUNCTION PROTOTYPES (FINAL / MATCH ARDUINO ABI)
 // ============================================================================
 bool readDriverTempsPT100(int &tL, int &tR);
-bool readEngineVoltageADS1115(float &vOut);
 float readCurrentADC(uint8_t adsChannel, uint8_t idx);
 void updateSensors(void);
 
 void updateDriverFans(void);
-void logicWatchdog(unsigned long now);
 
 // ============================================================================
 // SYSTEM LIMITS / THRESHOLDS
@@ -130,15 +128,6 @@ constexpr int16_t CUR_TRIP_A_CH[4] = {
   90    // R2
 };
 
-// ==================================================
-// ADS1115 ASYNC CURRENT STATE
-// ==================================================
-struct ADSAsyncCurrentState {
-  uint8_t channelIndex;
-  bool conversionRunning;
-};
-
-ADSAsyncCurrentState adsAsync = {0, false};
 // ============================================================================
 // ENGINE VOLTAGE DETECTION
 // ============================================================================
@@ -242,9 +231,9 @@ Storm32Controller gimbal(Serial2, ibus);
 
 bool autoReverseActive = false;
 uint32_t autoReverseStart_ms = 0;
-
 constexpr uint16_t AUTO_REV_PWM = 300;
 constexpr uint32_t AUTO_REV_MS = 350;
+constexpr uint32_t AUTO_REV_RESET_WINDOW_MS = 5000;
 
 Adafruit_ADS1115 adsCur;
 Adafruit_ADS1115 adsVolt;
@@ -270,12 +259,19 @@ constexpr uint8_t ADS_CUR_CH_MAP[4] = {
 uint8_t overCurCnt[4] = { 0 };
 
 // ============================================================================
-// WATCHDOG FLAGS (LOGIC-LEVEL)
+// WATCHDOG DOMAINS (DUAL-LAYER ARCH)
 // ============================================================================
-volatile bool wdCommsOK = false;
-volatile bool wdSensorOK = false;
-volatile bool wdDriveOK = false;
-volatile bool wdBladeOK = false;
+constexpr uint16_t WD_SENSOR_TIMEOUT_MS = 80;  // เดิม 30 → เพิ่ม margin I2C field delay
+struct WatchdogDomain {
+  uint32_t lastUpdate_ms;
+  uint32_t timeout_ms;
+  bool faulted;
+};
+
+WatchdogDomain wdSensor = { 0, WD_SENSOR_TIMEOUT_MS, false };
+WatchdogDomain wdComms = { 0, 150, false };
+WatchdogDomain wdDrive = { 0, 100, false };
+WatchdogDomain wdBlade = { 0, 100, false };
 
 // ============================================================================
 // PWM CONFIG
@@ -320,6 +316,9 @@ constexpr float V_WARN_LOW = 24.0f;
 constexpr float V_WARN_CRITICAL = 23.0f;
 
 bool voltageWarnMutedByReset = false;
+
+constexpr uint32_t VOLT_SENSOR_TIMEOUT_MS = 1500;   // เดิม 500 → 1.5 วินาที
+constexpr uint8_t  VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอบติดก่อน latch
 
 // ============================================================================
 // UTIL
@@ -402,85 +401,6 @@ void updateDriverFans(void) {
   lastPwmR = pwmR;
 }
 
-// ============================================================================
-// LOGIC WATCHDOG (SOFT)
-// ============================================================================
-void logicWatchdog(unsigned long now) {
-
-  static unsigned long lastOk_ms = 0;
-
-  if (wdCommsOK && wdSensorOK && wdDriveOK && wdBladeOK) {
-    lastOk_ms = now;
-    return;
-  }
-
-  if (now - lastOk_ms > LOGIC_WDT_MS) {
-    latchFault(FaultCode::LOGIC_WATCHDOG);
-  }
-}
-
-// ============================================================================
-// READ ENGINE VOLTAGE VIA ADS1115 (ISOLATED, FILTERED)
-// ใช้ ADS1115 ตัวแรงดันเท่านั้น
-// ============================================================================
-bool readEngineVoltageADS1115(float &vOut) {
-
-  constexpr uint8_t ADS_CH = 0;  // ช่อง ADS1115 ที่ต่อ divider
-  constexpr uint8_t SAMPLE_N = 5;
-
-  // Divider ratio (150k / 33k)
-  constexpr float DIV_RATIO = (150.0f + 33.0f) / 33.0f;
-
-  // ADS1115 LSB @ GAIN_ONE
-  constexpr float ADS_LSB_V = 4.096f / 32768.0f;
-
-  constexpr float MAX_DV_DT = 1.2f;  // V ต่อรอบ
-
-  static float buf[SAMPLE_N] = { 0 };
-  static uint8_t idx = 0;
-  static bool filled = false;
-  static float lastV = 0;
-
-  int32_t sum = 0;
-
-  // -------- SAMPLE FROM ADS1115 (VOLTAGE ADC) --------
-  for (uint8_t i = 0; i < SAMPLE_N; i++) {
-    sum += adsVolt.readADC_SingleEnded(ADS_CH);
-  }
-
-  int32_t raw = sum / SAMPLE_N;
-
-  float v_adc = raw * ADS_LSB_V;
-  float vRaw = v_adc * DIV_RATIO;
-
-  if (vRaw < 0.0f || vRaw > 40.0f) return false;
-
-  if (filled && fabs(vRaw - lastV) > MAX_DV_DT) return false;
-  lastV = vRaw;
-
-  buf[idx++] = vRaw;
-  if (idx >= SAMPLE_N) {
-    idx = 0;
-    filled = true;
-  }
-
-  if (!filled) return false;
-
-  float tmp[SAMPLE_N];
-  memcpy(tmp, buf, sizeof(tmp));
-  for (uint8_t i = 0; i < SAMPLE_N - 1; i++) {
-    for (uint8_t j = i + 1; j < SAMPLE_N; j++) {
-      if (tmp[j] < tmp[i]) {
-        float t = tmp[i];
-        tmp[i] = tmp[j];
-        tmp[j] = t;
-      }
-    }
-  }
-
-  vOut = tmp[SAMPLE_N / 2];
-  return true;
-}
 
 // ============================================================================
 // READ CURRENT VIA MCU ADC (ACS SENSOR)
@@ -815,9 +735,6 @@ void updateEngineState(uint32_t now) {
   static uint32_t stopConfirm_ms = 0;
   float v = engineVolt;
 
-  // ===== IGNORE DURING STARTER =====
-  if (starterActive) return;
-
   // =================================================
   // LOCK DURING STARTER
   // =================================================
@@ -986,37 +903,51 @@ void latchFault(FaultCode code) {
 }
 
 void updateComms(uint32_t now) {
-  // =========================
+  // ==================================================
   // IBUS BYTE PARSING
-  // =========================
+  // ==================================================
   bool gotByte = false;
+
   while (Serial1.available()) {
     ibus.loop();
     lastIbusByte_ms = now;
     gotByte = true;
   }
-  // =========================
-  // RECOVERY: BYTE COMES BACK
-  // =========================
-  if (gotByte && ibusCommLost) {
+
+  // ==================================================
+  // RECOVERY: BYTE RETURNS
+  // ==================================================
+  if (gotByte) {
+    if (ibusCommLost) {
+#if DEBUG_SERIAL
+      Serial.println(F("[IBUS] RECOVERED"));
+#endif
+    }
+
     ibusCommLost = false;
-    // ❗ ห้าม clear driveSafety ที่นี่
+
+    // ✔ Dual-layer freshness update
+    wdComms.lastUpdate_ms = now;
   }
 
-  // =========================
-  // SOFT TIMEOUT → COMM LOST
-  // =========================
+  // ==================================================
+  // SOFT TIMEOUT (COMM LOST → EMERGENCY)
+  // ==================================================
   if (now - lastIbusByte_ms > 100) {
     if (!ibusCommLost) {
+#if DEBUG_SERIAL
+      Serial.println(F("[IBUS] SOFT LOST"));
+#endif
       ibusCommLost = true;
-      requireIbusConfirm = true;  // <<< สำคัญ
+      requireIbusConfirm = true;
     }
+
     driveSafety = SafetyState::EMERGENCY;
   }
 
-  // =========================
-  // HARD TIMEOUT → FAULT
-  // =========================
+  // ==================================================
+  // HARD TIMEOUT (FAULT)
+  // ==================================================
   if (now - lastIbusByte_ms > IBUS_TIMEOUT_MS) {
 #if DEBUG_SERIAL
     Serial.println(F("[IBUS] HARD LOST -> FAULT"));
@@ -1024,10 +955,14 @@ void updateComms(uint32_t now) {
     latchFault(FaultCode::IBUS_LOST);
     return;
   }
-  // =========================
-  // COMMS OK
-  // =========================
-  wdCommsOK = true;
+
+  // ==================================================
+  // COMMS HEALTHY → update freshness
+  // (กรณีไม่มี byte ใหม่ แต่ยังไม่ timeout)
+  // ==================================================
+  if (!ibusCommLost) {
+    wdComms.lastUpdate_ms = now;
+  }
 }
 
 void checkI2CBus(uint32_t now) {
@@ -1064,116 +999,20 @@ void checkI2CBus(uint32_t now) {
   }
 }
 
-void updateCurrentAsync(uint32_t now)
-{
-  static float lastCurA[4] = {0};
-  static uint8_t stuckCnt[4] = {0};
+void updateSensors() {
 
-  // --------------------------------------------------
-  // START CONVERSION
-  // --------------------------------------------------
-  if (!adsAsync.conversionRunning)
-  {
-    uint16_t mux =
-      ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
-      (ADS_CUR_CH_MAP[adsAsync.channelIndex] << 12);
-
-    adsCur.startADCReading(mux, false);
-    adsAsync.conversionRunning = true;
-    return;
-  }
-
-  // --------------------------------------------------
-  // WAIT UNTIL READY
-  // --------------------------------------------------
-  if (!adsCur.conversionComplete())
-    return;
-
-  // --------------------------------------------------
-  // READ RESULT
-  // --------------------------------------------------
-  int16_t raw = adsCur.getLastConversionResults();
-
-  float v = raw * ADS1115_LSB_V;
-  float offsetV = g_acsOffsetV[adsAsync.channelIndex];
-  float a = (v - offsetV) / ACS_SENS_V_PER_A;
-
-  // plausibility
-  if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE)
-  {
-    latchFault(FaultCode::CUR_SENSOR_FAULT);
-    return;
-  }
-
-  // LPF
-  curA[adsAsync.channelIndex] +=
-    CUR_LPF_ALPHA * (a - curA[adsAsync.channelIndex]);
-
-  // stuck detect
-  if (abs(curL) > 200 || abs(curR) > 200)
-  {
-    if (fabs(curA[adsAsync.channelIndex] -
-             lastCurA[adsAsync.channelIndex]) < 0.03f)
-    {
-      if (++stuckCnt[adsAsync.channelIndex] > 40)
-      {
-        latchFault(FaultCode::CUR_SENSOR_FAULT);
-        return;
-      }
-    }
-    else
-    {
-      stuckCnt[adsAsync.channelIndex] = 0;
-    }
-  }
-
-  lastCurA[adsAsync.channelIndex] =
-    curA[adsAsync.channelIndex];
-
-  // spike protect
-  if (a > CUR_SPIKE_A)
-  {
-    forceDriveSoftStop(now);
-    bladeState = BladeState::SOFT_STOP;
-  }
-
-  // overcurrent latch
-  if (a > CUR_TRIP_A_CH[adsAsync.channelIndex])
-  {
-    if (++overCurCnt[adsAsync.channelIndex] >= 2)
-    {
-      latchFault(FaultCode::OVER_CURRENT);
-      return;
-    }
-  }
-  else
-  {
-    overCurCnt[adsAsync.channelIndex] = 0;
-  }
-
-  // --------------------------------------------------
-  // NEXT CHANNEL
-  // --------------------------------------------------
-  adsAsync.channelIndex++;
-  if (adsAsync.channelIndex >= 4)
-    adsAsync.channelIndex = 0;
-
-  adsAsync.conversionRunning = false;
-}
-
-// ============================================================================
-// updateSensors()  (NON-BLOCKING STATE MACHINE VERSION)
-// ============================================================================
-void updateSensors()
-{
   uint32_t now = millis();
+
+  // ==================================================
+  // SENSOR TASK ALIVE (ANTI-FALSE WATCHDOG)
+  // ==================================================
+  wdSensor.lastUpdate_ms = now;
 
 #if TEST_MODE
   curA[0] = curA[1] = curA[2] = curA[3] = 5.0f;
   tempDriverL = 45;
   tempDriverR = 47;
   engineVolt = 26.0f;
-  wdSensorOK = true;
   return;
 #endif
 
@@ -1190,25 +1029,23 @@ void updateSensors()
 
   static I2CRecoverState i2cState = I2CRecoverState::IDLE;
   static uint32_t i2cStateStart_ms = 0;
-  static uint8_t  i2cResetCount = 0;
+  static uint8_t i2cResetCount = 0;
 
-  if (Wire.getWireTimeoutFlag() && i2cState == I2CRecoverState::IDLE)
-  {
+  if (Wire.getWireTimeoutFlag() && i2cState == I2CRecoverState::IDLE) {
     Wire.clearWireTimeoutFlag();
     i2cState = I2CRecoverState::END_BUS;
     i2cStateStart_ms = now;
   }
 
-  switch (i2cState)
-  {
+  switch (i2cState) {
+
     case I2CRecoverState::END_BUS:
       Wire.end();
       i2cState = I2CRecoverState::BEGIN_BUS;
       break;
 
     case I2CRecoverState::BEGIN_BUS:
-      if (now - i2cStateStart_ms >= 1)   // 1ms spacing
-      {
+      if (now - i2cStateStart_ms >= 1) {
         Wire.begin();
         Wire.setClock(100000);
         Wire.setWireTimeout(6000, true);
@@ -1230,8 +1067,7 @@ void updateSensors()
       break;
 
     case I2CRecoverState::DONE:
-      if (i2cResetCount >= 3)
-      {
+      if (i2cResetCount >= 3) {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
         return;
       }
@@ -1245,112 +1081,135 @@ void updateSensors()
   // ==================================================
   // HARDWARE OVERCURRENT
   // ==================================================
-  if (digitalRead(PIN_CUR_TRIP) == LOW)
-  {
+  if (digitalRead(PIN_CUR_TRIP) == LOW) {
     latchFault(FaultCode::OVER_CURRENT);
     return;
   }
 
   // ==================================================
-  // ----------- ASYNC CURRENT (1 CH PER LOOP) -------
+  // ----------- ASYNC CURRENT (WITH STALL GUARD) -----
   // ==================================================
   static uint8_t curIdx = 0;
   static bool curConvRunning = false;
+  static uint32_t curConvStart_ms = 0;
 
-  if (!curConvRunning)
-  {
+  constexpr uint16_t CUR_CONV_TIMEOUT_MS = 25;
+
+  if (!curConvRunning) {
+
     uint16_t mux =
-      ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
-      (ADS_CUR_CH_MAP[curIdx] << 12);
+      ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[curIdx] << 12);
 
     adsCur.startADCReading(mux, false);
     curConvRunning = true;
-  }
-  else if (adsCur.conversionComplete())
-  {
-    int16_t raw = adsCur.getLastConversionResults();
-    float v = raw * ADS1115_LSB_V;
-    float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
+    curConvStart_ms = now;
 
-    if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE)
-    {
-      latchFault(FaultCode::CUR_SENSOR_FAULT);
+  } else {
+
+    if (adsCur.conversionComplete()) {
+
+      int16_t raw = adsCur.getLastConversionResults();
+      float v = raw * ADS1115_LSB_V;
+      float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
+
+      if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE) {
+        latchFault(FaultCode::CUR_SENSOR_FAULT);
+        return;
+      }
+
+      curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
+
+      if (a > CUR_SPIKE_A) {
+        forceDriveSoftStop(now);
+        bladeState = BladeState::SOFT_STOP;
+      }
+
+      if (a > CUR_TRIP_A_CH[curIdx]) {
+        if (++overCurCnt[curIdx] >= 2) {
+          latchFault(FaultCode::OVER_CURRENT);
+          return;
+        }
+      } else {
+        overCurCnt[curIdx] = 0;
+      }
+
+      curIdx++;
+      if (curIdx >= 4) curIdx = 0;
+
+      curConvRunning = false;
+    }
+    else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
+
+#if DEBUG_SERIAL
+      Serial.println(F("[ADS] CURRENT CONVERSION TIMEOUT"));
+#endif
+      curConvRunning = false;
+    }
+  }
+
+  // ==================================================
+  // ----------- ASYNC VOLTAGE (WITH STALL GUARD) -----
+  // ==================================================
+  static bool voltConvRunning = false;
+  static uint32_t voltConvStart_ms = 0;
+  static uint32_t lastVoltOk_ms = 0;
+  static uint8_t voltFailCnt = 0;
+
+  constexpr uint16_t VOLT_CONV_TIMEOUT_MS = 25;
+
+  if (!voltConvRunning) {
+    adsVolt.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
+    voltConvRunning = true;
+    voltConvStart_ms = now;
+  }
+  else {
+
+    if (adsVolt.conversionComplete()) {
+
+      int16_t raw = adsVolt.getLastConversionResults();
+      float v_adc = raw * ADS1115_LSB_V;
+      float vRaw = v_adc * ((150.0f + 33.0f) / 33.0f);
+
+      if (vRaw > 0.0f && vRaw < 40.0f) {
+        engineVolt += 0.15f * (vRaw - engineVolt);
+        lastVoltOk_ms = now;
+      }
+
+      voltConvRunning = false;
+    }
+    else if (now - voltConvStart_ms > VOLT_CONV_TIMEOUT_MS) {
+
+#if DEBUG_SERIAL
+      Serial.println(F("[ADS] VOLT CONVERSION TIMEOUT"));
+#endif
+      voltConvRunning = false;
+    }
+  }
+
+  // -------- Voltage timeout logic --------
+  if (now - lastVoltOk_ms > VOLT_SENSOR_TIMEOUT_MS) {
+
+    if (++voltFailCnt >= VOLT_SENSOR_FAIL_COUNT) {
+      latchFault(FaultCode::VOLT_SENSOR_FAULT);
       return;
     }
 
-    curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
-
-    if (a > CUR_SPIKE_A)
-    {
-      forceDriveSoftStop(now);
-      bladeState = BladeState::SOFT_STOP;
-    }
-
-    if (a > CUR_TRIP_A_CH[curIdx])
-    {
-      if (++overCurCnt[curIdx] >= 2)
-      {
-        latchFault(FaultCode::OVER_CURRENT);
-        return;
-      }
-    }
-    else
-    {
-      overCurCnt[curIdx] = 0;
-    }
-
-    curIdx++;
-    if (curIdx >= 4) curIdx = 0;
-    curConvRunning = false;
+  } else {
+    voltFailCnt = 0;
   }
 
   // ==================================================
-  // ----------- ASYNC VOLTAGE (50ms window) ----------
-  // ==================================================
-  static bool voltConvRunning = false;
-  static uint32_t lastVoltTrigger_ms = 0;
-  static uint32_t lastVoltOk_ms = 0;
-
-  if (!voltConvRunning && (now - lastVoltTrigger_ms >= 50))
-  {
-    adsVolt.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
-    voltConvRunning = true;
-    lastVoltTrigger_ms = now;
-  }
-  else if (voltConvRunning && adsVolt.conversionComplete())
-  {
-    int16_t raw = adsVolt.getLastConversionResults();
-    float v_adc = raw * ADS1115_LSB_V;
-    float vRaw = v_adc * ((150.0f + 33.0f) / 33.0f);
-
-    if (vRaw > 0.0f && vRaw < 40.0f)
-    {
-      engineVolt += 0.15f * (vRaw - engineVolt);
-      lastVoltOk_ms = now;
-    }
-
-    voltConvRunning = false;
-  }
-
-  if (now - lastVoltOk_ms > 500)
-  {
-    latchFault(FaultCode::VOLT_SENSOR_FAULT);
-    return;
-  }
-
-  // ==================================================
-  // ----------- TEMPERATURE (100ms window) ----------
+  // ----------- TEMPERATURE --------------------------
   // ==================================================
   static uint32_t lastTemp_ms = 0;
   static uint32_t lastTempOk_ms = 0;
 
-  if (now - lastTemp_ms >= 100)
-  {
+  if (now - lastTemp_ms >= 100) {
+
     lastTemp_ms = now;
 
     int16_t tL, tR;
-    if (!readDriverTempsPT100(tL, tR))
-    {
+    if (!readDriverTempsPT100(tL, tR)) {
       latchFault(FaultCode::TEMP_SENSOR_FAULT);
       return;
     }
@@ -1359,20 +1218,50 @@ void updateSensors()
     tempDriverR = tR;
     lastTempOk_ms = now;
 
-    if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C)
-    {
+    if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C) {
       latchFault(FaultCode::OVER_TEMP);
       return;
     }
   }
 
-  if (now - lastTempOk_ms > 500)
-  {
+  if (now - lastTempOk_ms > 500) {
     latchFault(FaultCode::TEMP_SENSOR_FAULT);
     return;
   }
+}
 
-  wdSensorOK = true;
+// ============================================================================
+// AUTO REVERSE QUOTA RESET (SAFE WINDOW BASED)
+// ============================================================================
+void updateAutoReverseReset(uint32_t now) {
+  static uint32_t safeStart_ms = 0;
+
+  // ต้องอยู่ใน RUN และไม่อยู่ LIMP / EMERGENCY
+  if (driveState != DriveState::RUN || driveSafety != SafetyState::SAFE || autoReverseActive) {
+    safeStart_ms = 0;
+    return;
+  }
+
+  // current ต้องต่ำกว่า warn
+  if (curLeft() > CUR_WARN_A || curRight() > CUR_WARN_A) {
+    safeStart_ms = 0;
+    return;
+  }
+
+  // เริ่มจับเวลา safe window
+  if (safeStart_ms == 0) {
+    safeStart_ms = now;
+    return;
+  }
+
+  // ถ้าปลอดภัยต่อเนื่องเกิน window → reset quota
+  if (now - safeStart_ms >= AUTO_REV_RESET_WINDOW_MS) {
+#if DEBUG_SERIAL
+    Serial.println(F("[AUTO REV] QUOTA RESET"));
+#endif
+    autoReverseCount = 0;
+    safeStart_ms = 0;
+  }
 }
 
 // ============================================================================
@@ -1465,7 +1354,7 @@ void runDrive(uint32_t now) {
   // =========================
   // DRIVE LOGIC OK
   // =========================
-  wdDriveOK = true;
+  wdDrive.lastUpdate_ms = now;
 }
 
 // ============================================================================
@@ -1506,7 +1395,29 @@ void runBlade(uint32_t now) {
       break;
   }
 
-  wdBladeOK = true;
+  wdBlade.lastUpdate_ms = now;
+}
+
+void monitorSubsystemWatchdogs(uint32_t now) {
+  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
+    latchFault(FaultCode::LOGIC_WATCHDOG);
+    wdSensor.faulted = true;
+  }
+
+  if (now - wdComms.lastUpdate_ms > wdComms.timeout_ms) {
+    latchFault(FaultCode::IBUS_LOST);
+    wdComms.faulted = true;
+  }
+
+  if (now - wdDrive.lastUpdate_ms > wdDrive.timeout_ms) {
+    latchFault(FaultCode::DRIVE_TIMEOUT);
+    wdDrive.faulted = true;
+  }
+
+  if (now - wdBlade.lastUpdate_ms > wdBlade.timeout_ms) {
+    latchFault(FaultCode::BLADE_TIMEOUT);
+    wdBlade.faulted = true;
+  }
 }
 
 // ============================================================================
@@ -1616,7 +1527,7 @@ void applyDrive() {
 }
 
 // ============================================================================
-// FAULT HANDLER (SINGLE POINT OF CUT)
+// FAULT HANDLER (SINGLE POINT OF CUT / HARD SAFE)
 // ============================================================================
 void handleFaultImmediateCut() {
 #if DEBUG_SERIAL
@@ -1626,26 +1537,49 @@ void handleFaultImmediateCut() {
     printed = true;
   }
 #endif
-  // ตัด drive
+
+  // --------------------------------------------------
+  // 1) DISABLE DRIVER POWER
+  // --------------------------------------------------
+  digitalWrite(PIN_DRV_ENABLE, LOW);
+
+  // --------------------------------------------------
+  // 2) CUT DRIVE OUTPUT
+  // --------------------------------------------------
   driveSafe();
   curL = 0;
   curR = 0;
-  // ตัด blade
+  targetL = 0;
+  targetR = 0;
+
+  // --------------------------------------------------
+  // 3) CUT BLADE THROTTLE
+  // --------------------------------------------------
   bladeServo.writeMicroseconds(1000);
-  // กัน watchdog trip ซ้ำ
-  wdCommsOK = true;
-  wdSensorOK = true;
-  wdDriveOK = true;
-  wdBladeOK = true;
+
+  // --------------------------------------------------
+  // 4) CUT STARTER
+  // --------------------------------------------------
+  starterActive = false;
+  digitalWrite(RELAY_STARTER, LOW);
+
+  // --------------------------------------------------
+  // 5) FORCE SAFETY STATE
+  // --------------------------------------------------
+  driveSafety = SafetyState::EMERGENCY;
 }
 
 void updateIgnition() {
   uint16_t ch6 = ibus.readChannel(CH_IGNITION);
   bool ignitionOn = (ch6 > 1600);
-  // ❗ ถ้า FAULT → ดับเครื่องเสมอ
-  if (systemState == SystemState::FAULT) {
+
+  // --------------------------------------------------
+  // HARD FAULT → ALWAYS OFF
+  // --------------------------------------------------
+  if (systemState == SystemState::FAULT || faultLatched) {
     ignitionOn = false;
   }
+
   digitalWrite(RELAY_IGNITION, ignitionOn ? HIGH : LOW);
 }
 
@@ -1697,63 +1631,101 @@ void updateStarter(uint32_t now) {
 }
 
 // ============================================================================
-// VOLTAGE WARNING (BUZZER + RELAY, MUTE AFTER RESET UNTIL VOLTAGE NORMAL)
+// VOLTAGE WARNING (BUZZER + RELAY, SAFE MUTE VIA CH_RESET)
 // ============================================================================
-void updateVoltageWarning(uint32_t now) {
+void updateVoltageWarning(uint32_t now)
+{
   static uint32_t lastToggle_ms = 0;
   static bool buzzerOn = false;
+  static bool lastResetState = false;   // edge detect กันกดค้าง
   float v24 = engineVolt;
 
-  // ===== SENSOR INVALID → DO NOTHING =====
-  if (!wdSensorOK) {
-    digitalWrite(PIN_BUZZER, LOW);
-    digitalWrite(RELAY_WARN, LOW);
-    return;
-  }
-
-  // --------------------------------------------------
-  // UNMUTE CONDITION
-  // แรงดันกลับสู่ปกติ → ปลด mute
-  // --------------------------------------------------
-  if (voltageWarnMutedByReset && v24 >= V_WARN_LOW) {
-#if DEBUG_SERIAL
-    Serial.println(F("[VOLT WARN] MUTE CLEARED (VOLT NORMAL)"));
-#endif
-    voltageWarnMutedByReset = false;
-  }
-  // --------------------------------------------------
-  // NORMAL VOLTAGE
-  // --------------------------------------------------
-  if (v24 >= V_WARN_LOW) {
+  // ==================================================
+  // SENSOR INVALID → FORCE OFF
+  // ==================================================
+  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms)
+  {
     digitalWrite(PIN_BUZZER, LOW);
     digitalWrite(RELAY_WARN, LOW);
     buzzerOn = false;
     return;
   }
+
+  // ==================================================
+  // READ RESET CHANNEL (EDGE DETECT)
+  // ==================================================
+  uint16_t chReset = ibus.readChannel(CH_RESET);
+  bool resetPressed = (chReset > 1600);
+
   // --------------------------------------------------
-  // MUTED STATE (AFTER RESET)
+  // MUTE REQUEST (ONLY WHEN VOLTAGE LOW)
+  // Rising edge only
   // --------------------------------------------------
-  if (voltageWarnMutedByReset) {
+  if (v24 < V_WARN_LOW && resetPressed && !lastResetState)
+  {
+#if DEBUG_SERIAL
+    Serial.println(F("[VOLT WARN] MUTE REQUESTED"));
+#endif
+    voltageWarnMutedByReset = true;
+  }
+
+  lastResetState = resetPressed;
+
+  // ==================================================
+  // UNMUTE CONDITION
+  // Voltage back to normal
+  // ==================================================
+  if (voltageWarnMutedByReset && v24 >= V_WARN_LOW)
+  {
+#if DEBUG_SERIAL
+    Serial.println(F("[VOLT WARN] MUTE CLEARED (VOLT NORMAL)"));
+#endif
+    voltageWarnMutedByReset = false;
+  }
+
+  // ==================================================
+  // NORMAL VOLTAGE
+  // ==================================================
+  if (v24 >= V_WARN_LOW)
+  {
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(RELAY_WARN, LOW);
+    buzzerOn = false;
+    return;
+  }
+
+  // ==================================================
+  // MUTED STATE
+  // (Buzzer off, relay still on)
+  // ==================================================
+  if (voltageWarnMutedByReset)
+  {
     digitalWrite(PIN_BUZZER, LOW);
     digitalWrite(RELAY_WARN, HIGH);
     return;
   }
-  // --------------------------------------------------
+
+  // ==================================================
   // LEVEL 1 : LOW VOLTAGE
-  // --------------------------------------------------
-  if (v24 < V_WARN_LOW && v24 >= V_WARN_CRITICAL) {
+  // ==================================================
+  if (v24 < V_WARN_LOW && v24 >= V_WARN_CRITICAL)
+  {
     digitalWrite(RELAY_WARN, HIGH);
-    if (now - lastToggle_ms >= 500) {
+
+    if (now - lastToggle_ms >= 500)
+    {
       lastToggle_ms = now;
       buzzerOn = !buzzerOn;
       digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
     }
     return;
   }
-  // --------------------------------------------------
+
+  // ==================================================
   // LEVEL 2 : CRITICAL VOLTAGE
-  // --------------------------------------------------
-  if (v24 < V_WARN_CRITICAL) {
+  // ==================================================
+  if (v24 < V_WARN_CRITICAL)
+  {
     digitalWrite(PIN_BUZZER, HIGH);
     digitalWrite(RELAY_WARN, HIGH);
   }
@@ -1834,6 +1806,68 @@ void debugIBus(uint32_t now) {
   Serial.print(F(" RST="));
   Serial.println(ibus.readChannel(CH_RESET));
 #endif
+}
+
+
+// ============================================================================
+// SYSTEM STATE TRANSITION
+// INIT -> ACTIVE (SAFE ARM LOGIC)
+// ============================================================================
+void updateSystemState(uint32_t now) {
+  static uint32_t ibusStableStart_ms = 0;
+
+  switch (systemState) {
+    case SystemState::INIT:
+      {
+        // ต้องไม่ fault
+        if (faultLatched)
+          return;
+
+        // ต้อง IBUS ไม่ lost
+        if (ibusCommLost) {
+          ibusStableStart_ms = 0;
+          return;
+        }
+
+        // ต้องนิ่งเกิน 1 วินาที
+        if (ibusStableStart_ms == 0) {
+          ibusStableStart_ms = now;
+          return;
+        }
+
+        if (now - ibusStableStart_ms < 1000)
+          return;
+
+        // ต้องกด RESET channel เพื่อ arm
+        uint16_t chReset = ibus.readChannel(CH_RESET);
+        if (chReset > 1600) {
+#if DEBUG_SERIAL
+          Serial.println(F("[SYSTEM] INIT -> ACTIVE"));
+#endif
+          systemState = SystemState::ACTIVE;
+          requireIbusConfirm = false;
+        }
+
+        break;
+      }
+
+    case SystemState::ACTIVE:
+      {
+        // ถ้า IBUS หาย → กลับ INIT
+        if (ibusCommLost) {
+#if DEBUG_SERIAL
+          Serial.println(F("[SYSTEM] ACTIVE -> INIT (IBUS LOST)"));
+#endif
+          systemState = SystemState::INIT;
+        }
+
+        break;
+      }
+
+    case SystemState::FAULT:
+    default:
+      break;
+  }
 }
 
 // ============================================================================
@@ -1980,13 +2014,21 @@ void setup() {
   voltageWarnMutedByReset = false;
 
   // --------------------------------------------------
-  // WATCHDOG FLAGS
+  // INIT WATCHDOG DOMAINS (CRITICAL: PREVENT BOOT FALSE TRIP)
   // --------------------------------------------------
-  wdCommsOK = false;
-  wdSensorOK = false;
-  wdDriveOK = false;
-  wdBladeOK = false;
+  {
+    uint32_t now = millis();
 
+    wdSensor.lastUpdate_ms = now;
+    wdComms.lastUpdate_ms = now;
+    wdDrive.lastUpdate_ms = now;
+    wdBlade.lastUpdate_ms = now;
+
+    wdSensor.faulted = false;
+    wdComms.faulted = false;
+    wdDrive.faulted = false;
+    wdBlade.faulted = false;
+  }
   // --------------------------------------------------
   // HW WATCHDOG (LAST)
   // --------------------------------------------------
@@ -1997,16 +2039,14 @@ void setup() {
 }
 
 void loop() {
-  // ==================================================
-  // HW WATCHDOG (MCU)
-  // ==================================================
+
   wdt_reset();
 
   uint32_t now = millis();
   uint32_t loopStart_us = micros();
 
   // ==================================================
-  // DEBUG (NON-BLOCKING)
+  // DEBUG
   // ==================================================
   debugTestMode(now);
   debugTelemetry(now);
@@ -2017,11 +2057,9 @@ void loop() {
   // ==================================================
   uint32_t tComms_us = micros();
   updateComms(now);
-  uint32_t dtComms_us = micros() - tComms_us;
+  updateSystemState(now);
 
-  if (!ibusCommLost) wdCommsOK = true;
-
-  if (dtComms_us > BUDGET_COMMS_MS * 1000UL) {
+  if (micros() - tComms_us > BUDGET_COMMS_MS * 1000UL) {
     latchFault(FaultCode::COMMS_TIMEOUT);
     goto LOOP_FAULT_EXIT;
   }
@@ -2029,24 +2067,22 @@ void loop() {
   // ==================================================
   // PHASE 1 : SENSORS
   // ==================================================
-  uint32_t tSensors_us = micros();
   updateSensors();
-  uint32_t dtSensors_us = micros() - tSensors_us;
 
-  if (dtSensors_us > BUDGET_SENSORS_MS * 1000UL) {
+  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
     latchFault(FaultCode::LOGIC_WATCHDOG);
     goto LOOP_FAULT_EXIT;
   }
 
   updateEngineState(now);
 
-  // ==================================================
-  // DRIVE ANOMALY DETECTION
-  // ==================================================
   detectSideImbalanceAndSteer();
   detectWheelStuck(now);
   detectWheelLock();
 
+  // ==================================================
+  // SAFETY MANAGER
+  // ==================================================
   SafetyInput sin;
   memcpy(sin.curA, curA, sizeof(curA));
   sin.tempDriverL = tempDriverL;
@@ -2069,96 +2105,33 @@ void loop() {
     autoReverseActive,
     lastDriveEvent);
 
+  updateAutoReverseReset(now);
 
   // ==================================================
-  // SYSTEM STATE UPDATE
+  // SYSTEM STATE CHECK
   // ==================================================
   if (faultLatched) {
     systemState = SystemState::FAULT;
-  } else {
-    switch (systemState) {
-      case SystemState::INIT:
-        {
-          static uint32_t warmupStart_ms = 0;
-          driveSafe();
-
-          if (warmupStart_ms == 0) {
-            warmupStart_ms = now;
-            break;
-          }
-          if (now - warmupStart_ms < SENSOR_WARMUP_MS) break;
-
-          if (!readDriverTempsPT100(tempDriverL, tempDriverR)) {
-            latchFault(FaultCode::TEMP_SENSOR_FAULT);
-            break;
-          }
-          if (ibus.readChannel(CH_THROTTLE) < 900 || ibus.readChannel(CH_THROTTLE) > 2100) {
-            latchFault(FaultCode::IBUS_LOST);
-            break;
-          }
-          for (uint8_t i = 0; i < 4; i++) g_acsOffsetV[i] = 2.5f;
-
-          systemState = SystemState::WAIT_NEUTRAL;
-          warmupStart_ms = 0;
-          break;
-        }
-
-      case SystemState::WAIT_NEUTRAL:
-        {
-          static uint32_t powerStable_ms = 0;
-
-          if (engineVolt < 24.5f) {
-            powerStable_ms = 0;
-            break;
-          }
-          if (powerStable_ms == 0) {
-            powerStable_ms = now;
-            break;
-          }
-          if (now - powerStable_ms < 2000) break;
-
-          if (!ibusCommLost && neutral(ibus.readChannel(CH_THROTTLE))) {
-            systemState = SystemState::ACTIVE;
-            powerStable_ms = 0;
-          }
-          break;
-        }
-
-      case SystemState::WAIT_BLADE_ARM:
-        if (ibus.readChannel(CH_ENGINE) < 1200)
-          systemState = SystemState::ACTIVE;
-        break;
-
-      default:
-        break;
-    }
   }
 
-  // ==================================================
-  // FAULT HANDLING (ABSOLUTE CUT)
-  // ==================================================
   if (systemState == SystemState::FAULT) {
     handleFaultImmediateCut();
+    digitalWrite(PIN_DRV_ENABLE, LOW);
+    return;
+  }
 
-    // ❗ NO HEARTBEAT HERE
-    wdCommsOK = wdSensorOK = wdDriveOK = wdBladeOK = true;
+  if (systemState != SystemState::ACTIVE) {
+    driveSafe();
+    digitalWrite(PIN_DRV_ENABLE, LOW);
     return;
   }
 
   // ==================================================
-  // EARLY EXIT (NOT ACTIVE)
-  // ==================================================
-  if (systemState != SystemState::ACTIVE) {
-    driveSafe();
-    wdDriveOK = wdBladeOK = true;
-    goto LOOP_WATCHDOG;
-  }
-
-  // ==================================================
-  // PHASE 2 : DRIVE / BLADE
+  // PHASE 2 : DRIVE
   // ==================================================
   uint32_t tDrive_us = micros();
   runDrive(now);
+
   if (micros() - tDrive_us > BUDGET_DRIVE_MS * 1000UL) {
     latchFault(FaultCode::DRIVE_TIMEOUT);
     goto LOOP_FAULT_EXIT;
@@ -2166,6 +2139,7 @@ void loop() {
 
   uint32_t tBlade_us = micros();
   runBlade(now);
+
   if (micros() - tBlade_us > BUDGET_BLADE_MS * 1000UL) {
     latchFault(FaultCode::BLADE_TIMEOUT);
     goto LOOP_FAULT_EXIT;
@@ -2182,36 +2156,76 @@ void loop() {
   updateIgnition();
   updateStarter(now);
 
-  // ==================================================
-  // STORM32 (STRICT SLAVE)
-  // ==================================================
   gimbal.setSystemEnabled(
-    systemState == SystemState::ACTIVE && driveSafety != SafetyState::EMERGENCY && !requireIbusConfirm);
+    systemState == SystemState::ACTIVE &&
+    driveSafety != SafetyState::EMERGENCY &&
+    !requireIbusConfirm);
 
   gimbal.update(now);
   telemetryCSV(now);
 
+  // ==================================================
+  // LAYER 2 : SUBSYSTEM WATCHDOG
+  // ==================================================
+  monitorSubsystemWatchdogs(now);
+
+  // ==================================================
+  // LOOP OVERRUN GUARD
+  // ==================================================
   if (micros() - loopStart_us > BUDGET_LOOP_MS * 1000UL) {
     latchFault(FaultCode::LOOP_OVERRUN);
     goto LOOP_FAULT_EXIT;
   }
 
-  digitalWrite(PIN_DRV_ENABLE,
-               (systemState == SystemState::ACTIVE && !faultLatched && driveSafety != SafetyState::EMERGENCY));
+  // ==================================================
+  // DRIVER ENABLE (INDUSTRIAL SAFE VERSION)
+  // ==================================================
+  static uint32_t driveEnableArmStart_ms = 0;
+  bool driverEnable = false;
+
+  bool runAllowed =
+      (driveState == DriveState::RUN ||
+       driveState == DriveState::LIMP);
+
+  bool hardCut =
+      (systemState != SystemState::ACTIVE) ||
+      faultLatched ||
+      (driveSafety == SafetyState::EMERGENCY) ||
+      (driveState == DriveState::SOFT_STOP) ||
+      (driveState == DriveState::LOCKED);
+
+  if (hardCut) {
+    driveEnableArmStart_ms = 0;
+    digitalWrite(PIN_DRV_ENABLE, LOW);
+  }
+  else if (runAllowed) {
+
+    if (driveEnableArmStart_ms == 0) {
+      driveEnableArmStart_ms = now;
+    }
+
+    if (now - driveEnableArmStart_ms >= 50) {
+      driverEnable = true;
+    }
+
+    digitalWrite(PIN_DRV_ENABLE, driverEnable);
+  }
+  else {
+    driveEnableArmStart_ms = 0;
+    digitalWrite(PIN_DRV_ENABLE, LOW);
+  }
 
   // ==================================================
-  // ❤️ HEARTBEAT (ONLY IF LOOP COMPLETED CLEANLY)
+  // HEARTBEAT
   // ==================================================
-  digitalWrite(PIN_HW_WD_HB, !digitalRead(PIN_HW_WD_HB));
+  digitalWrite(PIN_HW_WD_HB,
+               !digitalRead(PIN_HW_WD_HB));
 
-LOOP_WATCHDOG:
-  logicWatchdog(now);
   return;
 
 LOOP_FAULT_EXIT:
-  // ❗ FAULT PATH → NO HEARTBEAT
-  wdCommsOK = wdSensorOK = wdDriveOK = wdBladeOK = true;
+
+  digitalWrite(PIN_DRV_ENABLE, LOW);
+  driveSafe();
   return;
 }
-
-
