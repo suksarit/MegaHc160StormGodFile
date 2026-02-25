@@ -317,8 +317,8 @@ constexpr float V_WARN_CRITICAL = 23.0f;
 
 bool voltageWarnMutedByReset = false;
 
-constexpr uint32_t VOLT_SENSOR_TIMEOUT_MS = 1500;   // เดิม 500 → 1.5 วินาที
-constexpr uint8_t  VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอบติดก่อน latch
+constexpr uint32_t VOLT_SENSOR_TIMEOUT_MS = 1500;  // เดิม 500 → 1.5 วินาที
+constexpr uint8_t VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอบติดก่อน latch
 
 // ============================================================================
 // UTIL
@@ -705,7 +705,6 @@ void updateDriveTarget() {
   targetL = (int16_t)outL;
   targetR = (int16_t)outR;
 }
-
 
 // ============================================================================
 // ENGINE THROTTLE SERVO (CH3 ANALOG CONTROL)
@@ -1137,8 +1136,7 @@ void updateSensors() {
       if (curIdx >= 4) curIdx = 0;
 
       curConvRunning = false;
-    }
-    else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
+    } else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
 
 #if DEBUG_SERIAL
       Serial.println(F("[ADS] CURRENT CONVERSION TIMEOUT"));
@@ -1161,8 +1159,7 @@ void updateSensors() {
     adsVolt.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
     voltConvRunning = true;
     voltConvStart_ms = now;
-  }
-  else {
+  } else {
 
     if (adsVolt.conversionComplete()) {
 
@@ -1176,8 +1173,7 @@ void updateSensors() {
       }
 
       voltConvRunning = false;
-    }
-    else if (now - voltConvStart_ms > VOLT_CONV_TIMEOUT_MS) {
+    } else if (now - voltConvStart_ms > VOLT_CONV_TIMEOUT_MS) {
 
 #if DEBUG_SERIAL
       Serial.println(F("[ADS] VOLT CONVERSION TIMEOUT"));
@@ -1633,18 +1629,16 @@ void updateStarter(uint32_t now) {
 // ============================================================================
 // VOLTAGE WARNING (BUZZER + RELAY, SAFE MUTE VIA CH_RESET)
 // ============================================================================
-void updateVoltageWarning(uint32_t now)
-{
+void updateVoltageWarning(uint32_t now) {
   static uint32_t lastToggle_ms = 0;
   static bool buzzerOn = false;
-  static bool lastResetState = false;   // edge detect กันกดค้าง
+  static bool lastResetState = false;  // edge detect กันกดค้าง
   float v24 = engineVolt;
 
   // ==================================================
   // SENSOR INVALID → FORCE OFF
   // ==================================================
-  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms)
-  {
+  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
     digitalWrite(PIN_BUZZER, LOW);
     digitalWrite(RELAY_WARN, LOW);
     buzzerOn = false;
@@ -1661,8 +1655,7 @@ void updateVoltageWarning(uint32_t now)
   // MUTE REQUEST (ONLY WHEN VOLTAGE LOW)
   // Rising edge only
   // --------------------------------------------------
-  if (v24 < V_WARN_LOW && resetPressed && !lastResetState)
-  {
+  if (v24 < V_WARN_LOW && resetPressed && !lastResetState) {
 #if DEBUG_SERIAL
     Serial.println(F("[VOLT WARN] MUTE REQUESTED"));
 #endif
@@ -1675,8 +1668,7 @@ void updateVoltageWarning(uint32_t now)
   // UNMUTE CONDITION
   // Voltage back to normal
   // ==================================================
-  if (voltageWarnMutedByReset && v24 >= V_WARN_LOW)
-  {
+  if (voltageWarnMutedByReset && v24 >= V_WARN_LOW) {
 #if DEBUG_SERIAL
     Serial.println(F("[VOLT WARN] MUTE CLEARED (VOLT NORMAL)"));
 #endif
@@ -1686,8 +1678,7 @@ void updateVoltageWarning(uint32_t now)
   // ==================================================
   // NORMAL VOLTAGE
   // ==================================================
-  if (v24 >= V_WARN_LOW)
-  {
+  if (v24 >= V_WARN_LOW) {
     digitalWrite(PIN_BUZZER, LOW);
     digitalWrite(RELAY_WARN, LOW);
     buzzerOn = false;
@@ -1698,8 +1689,7 @@ void updateVoltageWarning(uint32_t now)
   // MUTED STATE
   // (Buzzer off, relay still on)
   // ==================================================
-  if (voltageWarnMutedByReset)
-  {
+  if (voltageWarnMutedByReset) {
     digitalWrite(PIN_BUZZER, LOW);
     digitalWrite(RELAY_WARN, HIGH);
     return;
@@ -1708,12 +1698,10 @@ void updateVoltageWarning(uint32_t now)
   // ==================================================
   // LEVEL 1 : LOW VOLTAGE
   // ==================================================
-  if (v24 < V_WARN_LOW && v24 >= V_WARN_CRITICAL)
-  {
+  if (v24 < V_WARN_LOW && v24 >= V_WARN_CRITICAL) {
     digitalWrite(RELAY_WARN, HIGH);
 
-    if (now - lastToggle_ms >= 500)
-    {
+    if (now - lastToggle_ms >= 500) {
       lastToggle_ms = now;
       buzzerOn = !buzzerOn;
       digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
@@ -1724,8 +1712,7 @@ void updateVoltageWarning(uint32_t now)
   // ==================================================
   // LEVEL 2 : CRITICAL VOLTAGE
   // ==================================================
-  if (v24 < V_WARN_CRITICAL)
-  {
+  if (v24 < V_WARN_CRITICAL) {
     digitalWrite(PIN_BUZZER, HIGH);
     digitalWrite(RELAY_WARN, HIGH);
   }
@@ -2157,9 +2144,7 @@ void loop() {
   updateStarter(now);
 
   gimbal.setSystemEnabled(
-    systemState == SystemState::ACTIVE &&
-    driveSafety != SafetyState::EMERGENCY &&
-    !requireIbusConfirm);
+    systemState == SystemState::ACTIVE && driveSafety != SafetyState::EMERGENCY && !requireIbusConfirm);
 
   gimbal.update(now);
   telemetryCSV(now);
@@ -2184,21 +2169,15 @@ void loop() {
   bool driverEnable = false;
 
   bool runAllowed =
-      (driveState == DriveState::RUN ||
-       driveState == DriveState::LIMP);
+    (driveState == DriveState::RUN || driveState == DriveState::LIMP);
 
   bool hardCut =
-      (systemState != SystemState::ACTIVE) ||
-      faultLatched ||
-      (driveSafety == SafetyState::EMERGENCY) ||
-      (driveState == DriveState::SOFT_STOP) ||
-      (driveState == DriveState::LOCKED);
+    (systemState != SystemState::ACTIVE) || faultLatched || (driveSafety == SafetyState::EMERGENCY) || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
 
   if (hardCut) {
     driveEnableArmStart_ms = 0;
     digitalWrite(PIN_DRV_ENABLE, LOW);
-  }
-  else if (runAllowed) {
+  } else if (runAllowed) {
 
     if (driveEnableArmStart_ms == 0) {
       driveEnableArmStart_ms = now;
@@ -2209,8 +2188,7 @@ void loop() {
     }
 
     digitalWrite(PIN_DRV_ENABLE, driverEnable);
-  }
-  else {
+  } else {
     driveEnableArmStart_ms = 0;
     digitalWrite(PIN_DRV_ENABLE, LOW);
   }

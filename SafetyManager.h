@@ -6,16 +6,16 @@
 #define SAFETY_MANAGER_H
 
 #include <stdint.h>
-#include "SystemTypes.h"   // SafetyState, DriveEvent
+#include "SystemTypes.h"  // SafetyState, DriveEvent
 
 // ============================================================================
 // SAFETY INPUT SNAPSHOT (PURE DATA, NO GLOBAL DEPENDENCY)
 // ============================================================================
 struct SafetyInput {
-  float   curA[4];        // กระแสแต่ละช่อง
-  int16_t tempDriverL;    // อุณหภูมิไดรเวอร์ซ้าย
-  int16_t tempDriverR;    // อุณหภูมิไดรเวอร์ขวา
-  bool    faultLatched;   // fault ระดับระบบ
+  float curA[4];        // กระแสแต่ละช่อง
+  int16_t tempDriverL;  // อุณหภูมิไดรเวอร์ซ้าย
+  int16_t tempDriverR;  // อุณหภูมิไดรเวอร์ขวา
+  bool faultLatched;    // fault ระดับระบบ
 };
 
 // ============================================================================
@@ -40,8 +40,7 @@ extern SafetyState driveSafety;
 // PURE LOGIC: ไม่มี side-effect, ไม่มี global access
 SafetyState evaluateSafetyRaw(
   const SafetyInput& in,
-  const SafetyThresholds& th
-);
+  const SafetyThresholds& th);
 
 // STATE MACHINE: hysteresis + recovery control
 void updateSafetyStability(
@@ -49,11 +48,6 @@ void updateSafetyStability(
   uint32_t now,
   uint8_t& autoReverseCount,
   bool& autoReverseActive,
-  volatile DriveEvent& lastDriveEvent
-);
+  volatile DriveEvent& lastDriveEvent);
 
 #endif  // SAFETY_MANAGER_H
-
-
-
-

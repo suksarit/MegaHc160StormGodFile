@@ -3,7 +3,7 @@
 // ========================================================================================
 
 #include "SafetyManager.h"
-#include <Arduino.h>   // for max()
+#include <Arduino.h>  // for max()
 
 // ============================================================================
 // INTERNAL SAFETY STABILITY STATE (PRIVATE)
@@ -34,8 +34,7 @@ static constexpr uint32_t SAFE_STABLE_TIME_MS = 2000;
 // ============================================================================
 SafetyState evaluateSafetyRaw(
   const SafetyInput& in,
-  const SafetyThresholds& th
-) {
+  const SafetyThresholds& th) {
   // --------------------------------------------------
   // HARD FAULT ALWAYS WINS
   // --------------------------------------------------
@@ -47,15 +46,12 @@ SafetyState evaluateSafetyRaw(
 
   float curMax = max(
     max(in.curA[0], in.curA[1]),
-    max(in.curA[2], in.curA[3])
-  );
+    max(in.curA[2], in.curA[3]));
 
   // --------------------------------------------------
   // LIMP CONDITION
   // --------------------------------------------------
-  if (curMax > th.CUR_LIMP_A ||
-      in.tempDriverL > th.TEMP_LIMP_C ||
-      in.tempDriverR > th.TEMP_LIMP_C) {
+  if (curMax > th.CUR_LIMP_A || in.tempDriverL > th.TEMP_LIMP_C || in.tempDriverR > th.TEMP_LIMP_C) {
 
     warnCnt = 0;
 
@@ -70,9 +66,7 @@ SafetyState evaluateSafetyRaw(
   // --------------------------------------------------
   // WARN CONDITION
   // --------------------------------------------------
-  if (curMax > th.CUR_WARN_A ||
-      in.tempDriverL > th.TEMP_WARN_C ||
-      in.tempDriverR > th.TEMP_WARN_C) {
+  if (curMax > th.CUR_WARN_A || in.tempDriverL > th.TEMP_WARN_C || in.tempDriverR > th.TEMP_WARN_C) {
 
     limpCnt = 0;
 
@@ -100,8 +94,7 @@ void updateSafetyStability(
   uint32_t now,
   uint8_t& autoReverseCount,
   bool& autoReverseActive,
-  volatile DriveEvent& lastDriveEvent
-) {
+  volatile DriveEvent& lastDriveEvent) {
   // --------------------------------------------------
   // PUBLISH RAW SAFETY
   // --------------------------------------------------
@@ -111,7 +104,7 @@ void updateSafetyStability(
   // NOT SAFE → RESET STABILITY
   // --------------------------------------------------
   if (raw != SafetyState::SAFE) {
-    safetyStability    = SafetyStabilityState::SAFE_TRANSIENT;
+    safetyStability = SafetyStabilityState::SAFE_TRANSIENT;
     safeStableStart_ms = 0;
     return;
   }
@@ -131,12 +124,9 @@ void updateSafetyStability(
       safetyStability = SafetyStabilityState::SAFE_STABLE;
 
       // RESET AUTO-REVERSE ONLY WHEN FULLY SAFE
-      autoReverseCount  = 0;
+      autoReverseCount = 0;
       autoReverseActive = false;
-      lastDriveEvent    = DriveEvent::NONE;
+      lastDriveEvent = DriveEvent::NONE;
     }
   }
 }
-
-
-

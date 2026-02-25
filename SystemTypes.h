@@ -53,5 +53,3 @@ enum class BladeState : uint8_t {
 };
 
 #endif
-
-
