@@ -576,8 +576,6 @@ void detectSideImbalanceAndSteer() {
     targetL += STEER_COMP;
     targetR -= STEER_COMP;
   }
-
-  driveSafety = SafetyState::WARN;
 }
 
 void detectWheelStuck(uint32_t now) {
@@ -590,13 +588,11 @@ void detectWheelStuck(uint32_t now) {
   if (cL > CUR_LIMP_A && cR < CUR_WARN_A) {
     lastDriveEvent = DriveEvent::STUCK_LEFT;
     startAutoReverse(now);
-    driveSafety = SafetyState::LIMP;
   }
 
   if (cR > CUR_LIMP_A && cL < CUR_WARN_A) {
     lastDriveEvent = DriveEvent::STUCK_RIGHT;
     startAutoReverse(now);
-    driveSafety = SafetyState::LIMP;
   }
 }
 
@@ -1008,8 +1004,6 @@ void updateComms(uint32_t now) {
       ibusCommLost = true;
       requireIbusConfirm = true;
     }
-
-    driveSafety = SafetyState::EMERGENCY;
   }
 
   // ==================================================
@@ -1424,40 +1418,6 @@ void updateSensors() {
 }
 
 // ============================================================================
-// AUTO REVERSE QUOTA RESET (SAFE WINDOW BASED)
-// ============================================================================
-void updateAutoReverseReset(uint32_t now) {
-  static uint32_t safeStart_ms = 0;
-
-  // ต้องอยู่ใน RUN และไม่อยู่ LIMP / EMERGENCY
-  if (driveState != DriveState::RUN || driveSafety != SafetyState::SAFE || autoReverseActive) {
-    safeStart_ms = 0;
-    return;
-  }
-
-  // current ต้องต่ำกว่า warn
-  if (curLeft() > CUR_WARN_A || curRight() > CUR_WARN_A) {
-    safeStart_ms = 0;
-    return;
-  }
-
-  // เริ่มจับเวลา safe window
-  if (safeStart_ms == 0) {
-    safeStart_ms = now;
-    return;
-  }
-
-  // ถ้าปลอดภัยต่อเนื่องเกิน window → reset quota
-  if (now - safeStart_ms >= AUTO_REV_RESET_WINDOW_MS) {
-#if DEBUG_SERIAL
-    Serial.println(F("[AUTO REV] QUOTA RESET"));
-#endif
-    autoReverseCount = 0;
-    safeStart_ms = 0;
-  }
-}
-
-// ============================================================================
 // DRIVE STATE MACHINE (FIXED)
 // ============================================================================
 void runDrive(uint32_t now) {
@@ -1755,11 +1715,6 @@ void handleFaultImmediateCut() {
   // --------------------------------------------------
   starterActive = false;
   digitalWrite(RELAY_STARTER, LOW);
-
-  // --------------------------------------------------
-  // 5) FORCE SAFETY STATE
-  // --------------------------------------------------
-  driveSafety = SafetyState::EMERGENCY;
 }
 
 void updateIgnition() {
@@ -2243,38 +2198,39 @@ void loop() {
   // PHASE 1 : COMMS
   // ==================================================
   uint32_t tComms_us = micros();
+
   updateComms(now);
   updateSystemState(now);
 
   if (micros() - tComms_us > BUDGET_COMMS_MS * 1000UL) {
     latchFault(FaultCode::COMMS_TIMEOUT);
-    goto LOOP_FAULT_EXIT;
   }
 
   // ==================================================
-  // PHASE 1 : SENSORS
+  // PHASE 2 : SENSORS
   // ==================================================
   updateSensors();
 
   if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
     latchFault(FaultCode::LOGIC_WATCHDOG);
-    goto LOOP_FAULT_EXIT;
   }
 
   updateEngineState(now);
 
+  // --- Drive Event Detection (NO SAFETY WRITE HERE) ---
   detectSideImbalanceAndSteer();
   detectWheelStuck(now);
   detectWheelLock();
 
   // ==================================================
-  // SAFETY MANAGER
+  // SAFETY MANAGER (ONLY OWNER OF driveSafety)
   // ==================================================
   SafetyInput sin;
   memcpy(sin.curA, curA, sizeof(curA));
   sin.tempDriverL = tempDriverL;
   sin.tempDriverR = tempDriverR;
   sin.faultLatched = faultLatched;
+  sin.driveEvent = lastDriveEvent;
 
   SafetyThresholds sth = {
     CUR_WARN_A,
@@ -2292,36 +2248,41 @@ void loop() {
     autoReverseActive,
     lastDriveEvent);
 
-  updateAutoReverseReset(now);
-
   // ==================================================
-  // SYSTEM STATE CHECK
+  // SYSTEM STATE UPDATE
   // ==================================================
   if (faultLatched) {
     systemState = SystemState::FAULT;
   }
 
-  if (systemState == SystemState::FAULT) {
-    handleFaultImmediateCut();
-    digitalWrite(PIN_DRV_ENABLE, LOW);
-    return;
-  }
+  // ==================================================
+  // UNIFIED EMERGENCY AUTHORITY
+  // ==================================================
+  bool emergencyActive =
+    (systemState == SystemState::FAULT) || (driveSafety == SafetyState::EMERGENCY);
 
-  if (systemState != SystemState::ACTIVE) {
-    driveSafe();
+  // ==================================================
+  // SYSTEM GATE
+  // ==================================================
+  if (systemState != SystemState::ACTIVE || emergencyActive) {
+
+    handleFaultImmediateCut();  // single authority cut
     digitalWrite(PIN_DRV_ENABLE, LOW);
+
+    digitalWrite(PIN_HW_WD_HB,
+                 !digitalRead(PIN_HW_WD_HB));
+
     return;
   }
 
   // ==================================================
-  // PHASE 2 : DRIVE
+  // PHASE 3 : DRIVE
   // ==================================================
   uint32_t tDrive_us = micros();
   runDrive(now);
 
   if (micros() - tDrive_us > BUDGET_DRIVE_MS * 1000UL) {
     latchFault(FaultCode::DRIVE_TIMEOUT);
-    goto LOOP_FAULT_EXIT;
   }
 
   uint32_t tBlade_us = micros();
@@ -2329,13 +2290,12 @@ void loop() {
 
   if (micros() - tBlade_us > BUDGET_BLADE_MS * 1000UL) {
     latchFault(FaultCode::BLADE_TIMEOUT);
-    goto LOOP_FAULT_EXIT;
   }
 
   applyDrive();
 
   // ==================================================
-  // PHASE 3 : AUX
+  // PHASE 4 : AUX
   // ==================================================
   updateVoltageWarning(now);
   updateDriverFans();
@@ -2344,13 +2304,14 @@ void loop() {
   updateStarter(now);
 
   gimbal.setSystemEnabled(
-    systemState == SystemState::ACTIVE && driveSafety != SafetyState::EMERGENCY && !requireIbusConfirm);
+    systemState == SystemState::ACTIVE && !emergencyActive && !requireIbusConfirm);
 
   gimbal.update(now);
+
   telemetryCSV(now);
 
   // ==================================================
-  // LAYER 2 : SUBSYSTEM WATCHDOG
+  // SUBSYSTEM WATCHDOG LAYER
   // ==================================================
   monitorSubsystemWatchdogs(now);
 
@@ -2359,36 +2320,36 @@ void loop() {
   // ==================================================
   if (micros() - loopStart_us > BUDGET_LOOP_MS * 1000UL) {
     latchFault(FaultCode::LOOP_OVERRUN);
-    goto LOOP_FAULT_EXIT;
   }
 
   // ==================================================
-  // DRIVER ENABLE (INDUSTRIAL SAFE VERSION)
+  // DRIVER ENABLE
   // ==================================================
   static uint32_t driveEnableArmStart_ms = 0;
-  bool driverEnable = false;
 
   bool runAllowed =
     (driveState == DriveState::RUN || driveState == DriveState::LIMP);
 
   bool hardCut =
-    (systemState != SystemState::ACTIVE) || faultLatched || (driveSafety == SafetyState::EMERGENCY) || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
+    emergencyActive || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
 
   if (hardCut) {
+
     driveEnableArmStart_ms = 0;
     digitalWrite(PIN_DRV_ENABLE, LOW);
+
   } else if (runAllowed) {
 
-    if (driveEnableArmStart_ms == 0) {
+    if (driveEnableArmStart_ms == 0)
       driveEnableArmStart_ms = now;
-    }
 
-    if (now - driveEnableArmStart_ms >= 50) {
-      driverEnable = true;
-    }
+    if (now - driveEnableArmStart_ms >= 50)
+      digitalWrite(PIN_DRV_ENABLE, HIGH);
+    else
+      digitalWrite(PIN_DRV_ENABLE, LOW);
 
-    digitalWrite(PIN_DRV_ENABLE, driverEnable);
   } else {
+
     driveEnableArmStart_ms = 0;
     digitalWrite(PIN_DRV_ENABLE, LOW);
   }
@@ -2398,12 +2359,5 @@ void loop() {
   // ==================================================
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
-
-  return;
-
-LOOP_FAULT_EXIT:
-
-  digitalWrite(PIN_DRV_ENABLE, LOW);
-  driveSafe();
-  return;
 }
+

@@ -16,6 +16,7 @@ struct SafetyInput {
   int16_t tempDriverL;  // อุณหภูมิไดรเวอร์ซ้าย
   int16_t tempDriverR;  // อุณหภูมิไดรเวอร์ขวา
   bool faultLatched;    // fault ระดับระบบ
+   DriveEvent driveEvent; 
 };
 
 // ============================================================================

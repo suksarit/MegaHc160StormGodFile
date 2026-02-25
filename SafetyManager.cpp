@@ -63,6 +63,14 @@ SafetyState evaluateSafetyRaw(
     return SafetyState::WARN;
   }
 
+  if (in.driveEvent == DriveEvent::STUCK_LEFT || in.driveEvent == DriveEvent::STUCK_RIGHT) {
+    return SafetyState::LIMP;
+  }
+
+  if (in.driveEvent == DriveEvent::IMBALANCE) {
+    return SafetyState::WARN;
+  }
+
   // --------------------------------------------------
   // WARN CONDITION
   // --------------------------------------------------
