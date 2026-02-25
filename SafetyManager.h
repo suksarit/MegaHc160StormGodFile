@@ -49,8 +49,7 @@ void updateSafetyStability(
   uint32_t now,
   uint8_t& autoReverseCount,
   bool& autoReverseActive,
-  volatile DriveEvent& lastDriveEvent);
-
+  DriveEvent& lastDriveEvent);
 #endif  // SAFETY_MANAGER_H
 
 

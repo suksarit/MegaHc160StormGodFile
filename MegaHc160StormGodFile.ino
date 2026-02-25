@@ -139,27 +139,19 @@ constexpr uint8_t MAX_AUTO_REVERSE = 2;
 uint8_t autoReverseCount = 0;
 
 enum class FaultCode : uint8_t {
-  NONE,
-  // ===== Communication =====
-  IBUS_LOST,       // รีโมทขาดจริง
-  COMMS_TIMEOUT,   // loop / comms เกินเวลา
-  LOGIC_WATCHDOG,  // watchdog logic fail
-
-  // ===== Sensor =====
-  CUR_SENSOR_FAULT,  // ค่า current เพี้ยน / หลุดช่วง
+  NONE = 0,
+  IBUS_LOST,
+  COMMS_TIMEOUT,
+  LOGIC_WATCHDOG,
+  CUR_SENSOR_FAULT,
   VOLT_SENSOR_FAULT,
-  TEMP_SENSOR_FAULT,  // PT100 fault
-
-  // ===== Power / Thermal =====
-  OVER_CURRENT,  // กระแสเกิน threshold
-  OVER_TEMP,     // อุณหภูมิเกิน
-
-  // ===== Actuation timing =====
-  DRIVE_TIMEOUT,  // drive state ใช้เวลานานเกิน
-  BLADE_TIMEOUT,  // blade state ใช้เวลานานเกิน
-
-  // ===== System =====
-  LOOP_OVERRUN  // loop ใช้เวลานานเกิน budget
+  TEMP_SENSOR_FAULT,
+  OVER_CURRENT,
+  OVER_TEMP,
+  DRIVE_TIMEOUT,
+  BLADE_TIMEOUT,
+  LOOP_OVERRUN,
+  _COUNT
 };
 
 // ============================================================================
@@ -176,6 +168,13 @@ constexpr uint32_t FAULT_EEPROM_COOLDOWN_MS = 5000;  // เขียนได้
 
 static uint8_t faultWriteCount = 0;
 static uint32_t lastFaultWriteMs = 0;
+
+// ============================================================================
+// FAULT BACKGROUND WRITE QUEUE
+// ============================================================================
+volatile bool faultWritePending = false;
+FaultCode faultToStore = FaultCode::NONE;
+
 // ============================================================================
 // SENSOR / CALIBRATION
 // ============================================================================
@@ -234,7 +233,7 @@ float curA[4] = { 0 };
 int16_t tempDriverL = 0;
 int16_t tempDriverR = 0;
 
-volatile DriveEvent lastDriveEvent = DriveEvent::NONE;
+DriveEvent lastDriveEvent = DriveEvent::NONE;
 Storm32Controller gimbal(Serial2, ibus);
 
 bool autoReverseActive = false;
@@ -294,7 +293,7 @@ uint8_t overCurCnt[4] = { 0 };
 // ============================================================================
 // WATCHDOG DOMAINS (DUAL-LAYER ARCH)
 // ============================================================================
-constexpr uint16_t WD_SENSOR_TIMEOUT_MS = 80;  // เดิม 30 → เพิ่ม margin I2C field delay
+constexpr uint16_t WD_SENSOR_TIMEOUT_MS = 120;  // เดิม 30 → เพิ่ม margin I2C field delay
 struct WatchdogDomain {
   uint32_t lastUpdate_ms;
   uint32_t timeout_ms;
@@ -432,56 +431,6 @@ void updateDriverFans(void) {
 
   lastPwmL = pwmL;
   lastPwmR = pwmR;
-}
-
-
-// ============================================================================
-// READ CURRENT VIA MCU ADC (ACS SENSOR)
-// ============================================================================
-// ============================================================================
-// READ CURRENT VIA ADS1115 (ACS SENSOR, ISOLATED ADC)
-// แทน readCurrentADC() เดิม 100%
-// ============================================================================
-float readCurrentADC(uint8_t adsChannel, uint8_t idx) {
-
-  constexpr uint8_t SAMPLE_N = 4;
-  int32_t sum = 0;
-
-  // ------------------------------
-  // SAMPLE FROM ADS1115
-  // ------------------------------
-  for (uint8_t i = 0; i < SAMPLE_N; i++) {
-    sum += adsCur.readADC_SingleEnded(adsChannel);
-  }
-
-  int32_t raw = sum / SAMPLE_N;  // signed 16-bit
-
-  // ------------------------------
-  // RAW → VOLT
-  // ADS1115 @ GAIN_ONE = ±4.096V
-  // LSB = 4.096 / 32768 ≈ 0.000125 V
-  // ------------------------------
-  constexpr float ADS_LSB_V = 4.096f / 32768.0f;
-  float v = raw * ADS_LSB_V;
-
-  // ------------------------------
-  // OFFSET (0A reference, normally ~2.5V)
-  // ------------------------------
-  float offsetV = g_acsOffsetV[idx];
-
-  // ------------------------------
-  // VOLT → CURRENT
-  // ACS sensitivity = 40 mV/A
-  // ------------------------------
-  float a = (v - offsetV) / ACS_SENS_V_PER_A;
-
-  // ------------------------------
-  // CLAMP (PLAUSIBILITY)
-  // ------------------------------
-  if (a < CUR_MIN_PLAUSIBLE) a = CUR_MIN_PLAUSIBLE;
-  if (a > CUR_MAX_PLAUSIBLE) a = CUR_MAX_PLAUSIBLE;
-
-  return a;  // Ampere
 }
 
 // ============================================================================
@@ -878,7 +827,7 @@ void driveSafe() {
 }
 
 // ============================================================================
-// latchFault  (WITH EEPROM FAULT HISTORY)
+// latchFault  (NON-BLOCKING / EEPROM MOVED TO BACKGROUND)
 // ============================================================================
 void latchFault(FaultCode code) {
 
@@ -888,49 +837,11 @@ void latchFault(FaultCode code) {
   activeFault = code;
   faultLatched = true;
 
-  uint32_t now = millis();
-
-  // ==================================================
-  // EEPROM WRITE PROTECTION LAYER
-  // ==================================================
-
-  bool allowWrite = true;
-
-  // 1️⃣ จำกัดจำนวนครั้งต่อ boot
-  if (faultWriteCount >= MAX_FAULT_WRITES_PER_BOOT) {
-    allowWrite = false;
-#if DEBUG_SERIAL
-    Serial.println(F("[EEPROM] WRITE LIMIT REACHED"));
-#endif
-  }
-
-  // 2️⃣ Cooldown กันเขียนถี่
-  if (allowWrite && (now - lastFaultWriteMs < FAULT_EEPROM_COOLDOWN_MS)) {
-    allowWrite = false;
-#if DEBUG_SERIAL
-    Serial.println(F("[EEPROM] WRITE COOLDOWN ACTIVE"));
-#endif
-  }
-
-  // 3️⃣ เขียนเฉพาะเมื่อ Fault เปลี่ยนจริง
-  if (allowWrite) {
-
-    FaultCode lastStored;
-    EEPROM.get(100, lastStored);
-
-    if (lastStored != code) {
-
-      EEPROM.put(100, code);
-
-      faultWriteCount++;
-      lastFaultWriteMs = now;
-
-#if DEBUG_SERIAL
-      Serial.print(F("[EEPROM] FAULT STORED: "));
-      Serial.println((uint8_t)code);
-#endif
-    }
-  }
+  // --------------------------------------------------
+  // Queue EEPROM write (background task will handle)
+  // --------------------------------------------------
+  faultToStore = code;
+  faultWritePending = true;
 
 #if DEBUG_SERIAL
   Serial.println(F("========== FAULT SNAPSHOT =========="));
@@ -963,6 +874,68 @@ void latchFault(FaultCode code) {
   Serial.println(curR);
   Serial.println(F("===================================="));
 #endif
+}
+
+void backgroundFaultEEPROMTask(uint32_t now) {
+
+  // --------------------------------------------------
+  // NOTHING TO DO
+  // --------------------------------------------------
+  if (!faultWritePending)
+    return;
+
+  // --------------------------------------------------
+  // ANTI-WEAR LIMITS
+  // --------------------------------------------------
+  if (faultWriteCount >= MAX_FAULT_WRITES_PER_BOOT)
+    return;
+
+  if (now - lastFaultWriteMs < FAULT_EEPROM_COOLDOWN_MS)
+    return;
+
+  // --------------------------------------------------
+  // READ LAST STORED VALUE (SAFE RAW READ)
+  // --------------------------------------------------
+  uint8_t raw;
+  EEPROM.get(100, raw);
+
+  FaultCode lastStored;
+
+  if (!isValidEnum<FaultCode>(raw)) {
+    // EEPROM corruption → treat as NONE
+    lastStored = FaultCode::NONE;
+  } else {
+    lastStored = static_cast<FaultCode>(raw);
+  }
+
+  // --------------------------------------------------
+  // VALIDATE CURRENT FAULT BEFORE WRITE
+  // --------------------------------------------------
+  uint8_t newRaw = static_cast<uint8_t>(faultToStore);
+
+  if (!isValidEnum<FaultCode>(newRaw)) {
+    // Corrupted RAM value → do NOT write garbage
+    faultWritePending = false;
+    return;
+  }
+
+  // --------------------------------------------------
+  // WRITE ONLY IF CHANGED
+  // --------------------------------------------------
+  if (lastStored != faultToStore) {
+
+    EEPROM.put(100, newRaw);
+
+    faultWriteCount++;
+    lastFaultWriteMs = now;
+
+#if DEBUG_SERIAL
+    Serial.print(F("[EEPROM] FAULT STORED: "));
+    Serial.println(newRaw);
+#endif
+  }
+
+  faultWritePending = false;
 }
 
 void updateComms(uint32_t now) {
@@ -1417,16 +1390,13 @@ void updateSensors() {
   }
 }
 
-// ============================================================================
-// DRIVE STATE MACHINE (FIXED)
-// ============================================================================
 void runDrive(uint32_t now) {
+
   static DriveState lastDriveState = DriveState::IDLE;
   static uint32_t limpSafeStart_ms = 0;
-  // =========================
-  // STATE MACHINE
-  // =========================
+
   switch (driveState) {
+
     // --------------------------------------------------
     case DriveState::IDLE:
       targetL = 0;
@@ -1434,26 +1404,32 @@ void runDrive(uint32_t now) {
       curL = 0;
       curR = 0;
       limpSafeStart_ms = 0;
-      driveSoftStopStart_ms = 0;  // reset soft stop อย่างชัดเจน
+      driveSoftStopStart_ms = 0;
+
       if (systemState == SystemState::ACTIVE) {
         driveState = DriveState::RUN;
       }
       break;
+
     // --------------------------------------------------
     case DriveState::RUN:
       updateDriveTarget();
+
       if (driveSafety == SafetyState::EMERGENCY) {
         driveState = DriveState::SOFT_STOP;
-      } else if (driveSafety == SafetyState::LIMP) {
+      }
+      else if (driveSafety == SafetyState::LIMP) {
         driveState = DriveState::LIMP;
         limpSafeStart_ms = 0;
       }
       break;
 
+    // --------------------------------------------------
     case DriveState::LIMP:
       updateDriveTarget();
       targetL /= 2;
       targetR /= 2;
+
       if (driveSafety == SafetyState::EMERGENCY) {
         driveState = DriveState::SOFT_STOP;
         break;
@@ -1462,51 +1438,77 @@ void runDrive(uint32_t now) {
       if (driveSafety == SafetyState::SAFE) {
         if (limpSafeStart_ms == 0) {
           limpSafeStart_ms = now;
-        } else if (now - limpSafeStart_ms >= LIMP_RECOVER_MS) {
+        }
+        else if (now - limpSafeStart_ms >= LIMP_RECOVER_MS) {
 #if DEBUG_SERIAL
           Serial.println(F("[DRIVE] LIMP RECOVER -> RUN"));
 #endif
           driveState = DriveState::RUN;
           limpSafeStart_ms = 0;
         }
-      } else {
+      }
+      else {
         limpSafeStart_ms = 0;
       }
       break;
+
     // --------------------------------------------------
     case DriveState::SOFT_STOP:
       targetL = 0;
       targetR = 0;
-      // รอให้ ramp ลงจริง หรือ timeout
-      if ((curL == 0 && curR == 0) || (now - driveSoftStopStart_ms >= DRIVE_SOFT_STOP_TIMEOUT_MS)) {
-        driveSafe();  // ตัดกำลังจริง
+
+      if ((curL == 0 && curR == 0) ||
+          (now - driveSoftStopStart_ms >= DRIVE_SOFT_STOP_TIMEOUT_MS)) {
+
+        driveSafe();
         driveState = DriveState::LOCKED;
       }
       break;
+
     // --------------------------------------------------
     case DriveState::LOCKED:
-      driveSafe();  // safety latch
+      driveSafe();
+      break;
+
+    // --------------------------------------------------
+    default:
+      // ENUM CORRUPTION PROTECTION
+      latchFault(FaultCode::LOGIC_WATCHDOG);
+
+      driveSafe();
+      targetL = 0;
+      targetR = 0;
+      curL = 0;
+      curR = 0;
+
+      driveState = DriveState::LOCKED;
+      limpSafeStart_ms = 0;
+      driveSoftStopStart_ms = 0;
       break;
   }
-  // =========================
-  // DRIVE STATE TRANSITION DEBUG + INIT
-  // =========================
+
+  // ===================================================
+  // TRANSITION DEBUG + SOFT STOP INIT
+  // ===================================================
   if (driveState != lastDriveState) {
+
 #if DEBUG_SERIAL
     Serial.print(F("[DRIVE STATE] "));
     Serial.print((uint8_t)lastDriveState);
     Serial.print(F(" -> "));
     Serial.println((uint8_t)driveState);
 #endif
-    // ตั้งเวลา soft stop เฉพาะตอน "เข้า" ครั้งแรก
+
     if (driveState == DriveState::SOFT_STOP) {
       driveSoftStopStart_ms = now;
     }
+
     lastDriveState = driveState;
   }
-  // =========================
-  // DRIVE LOGIC OK
-  // =========================
+
+  // ===================================================
+  // DRIVE WATCHDOG FEED
+  // ===================================================
   wdDrive.lastUpdate_ms = now;
 }
 
@@ -1594,26 +1596,45 @@ void applyDrive() {
   }
 
   // ==================================================
-  // AUTO REVERSE OVERRIDE (SHORT PULSE ONLY)
+  // AUTO REVERSE OVERRIDE (DIRECTION-AWARE)
   // ==================================================
   if (autoReverseActive) {
+
     if (now - autoReverseStart_ms < AUTO_REV_MS) {
-      // ถอยตรง
-      digitalWrite(DIR_L1, LOW);
-      digitalWrite(DIR_L2, HIGH);
-      digitalWrite(DIR_R1, LOW);
-      digitalWrite(DIR_R2, HIGH);
+
+      // -----------------------------------------------
+      // Determine reverse direction per wheel
+      // Reverse opposite of current movement
+      // -----------------------------------------------
+
+      int8_t dirL = (curL > 0) ? -1 : (curL < 0 ? 1 : 0);
+      int8_t dirR = (curR > 0) ? -1 : (curR < 0 ? 1 : 0);
+
+      // ถ้าล้อใดหยุดนิ่ง ให้ถือว่า reverse ตรง
+      if (dirL == 0) dirL = -1;
+      if (dirR == 0) dirR = -1;
+
+      // LEFT
+      digitalWrite(DIR_L1, dirL > 0);
+      digitalWrite(DIR_L2, dirL < 0);
+
+      // RIGHT
+      digitalWrite(DIR_R1, dirR > 0);
+      digitalWrite(DIR_R2, dirR < 0);
+
       setPWM_L(AUTO_REV_PWM);
       setPWM_R(AUTO_REV_PWM);
-      return;  // ❗ override logic ปกติ
+
+      return;  // override normal drive
     } else {
+
       autoReverseActive = false;
+
 #if DEBUG_SERIAL
       Serial.println(F("[AUTO REV] END"));
 #endif
     }
   }
-
   // ==================================================
   // SAFETY EMERGENCY (NO DRIVE)
   // ==================================================
@@ -1947,67 +1968,69 @@ void debugIBus(uint32_t now) {
 #endif
 }
 
-
-// ============================================================================
-// SYSTEM STATE TRANSITION
-// INIT -> ACTIVE (SAFE ARM LOGIC)
-// ============================================================================
 void updateSystemState(uint32_t now) {
+
   static uint32_t ibusStableStart_ms = 0;
 
+  // ================================
+  // HARD FAULT HAS PRIORITY
+  // ================================
+  if (faultLatched) {
+    systemState = SystemState::FAULT;
+  }
+
   switch (systemState) {
+
+    // ------------------------------------------------
     case SystemState::INIT:
-      {
-        // ต้องไม่ fault
-        if (faultLatched)
-          return;
-
-        // ต้อง IBUS ไม่ lost
-        if (ibusCommLost) {
-          ibusStableStart_ms = 0;
-          return;
-        }
-
-        // ต้องนิ่งเกิน 1 วินาที
-        if (ibusStableStart_ms == 0) {
-          ibusStableStart_ms = now;
-          return;
-        }
-
-        if (now - ibusStableStart_ms < 1000)
-          return;
-
-        if (!calibrateCurrentOffsetNonBlocking(now))
-          return;
-
-        // ต้องกด RESET channel เพื่อ arm
-        uint16_t chReset = ibus.readChannel(CH_RESET);
-        if (chReset > 1600) {
-#if DEBUG_SERIAL
-          Serial.println(F("[SYSTEM] INIT -> ACTIVE"));
-#endif
-          systemState = SystemState::ACTIVE;
-          requireIbusConfirm = false;
-        }
-
-        break;
+    {
+      if (ibusCommLost) {
+        ibusStableStart_ms = 0;
+        return;
       }
 
+      if (ibusStableStart_ms == 0) {
+        ibusStableStart_ms = now;
+        return;
+      }
+
+      if (now - ibusStableStart_ms < 1000)
+        return;
+
+      if (!calibrateCurrentOffsetNonBlocking(now))
+        return;
+
+      uint16_t chReset = ibus.readChannel(CH_RESET);
+
+      if (chReset > 1600) {
+        systemState = SystemState::ACTIVE;
+        requireIbusConfirm = false;
+      }
+
+      break;
+    }
+
+    // ------------------------------------------------
     case SystemState::ACTIVE:
-      {
-        // ถ้า IBUS หาย → กลับ INIT
-        if (ibusCommLost) {
-#if DEBUG_SERIAL
-          Serial.println(F("[SYSTEM] ACTIVE -> INIT (IBUS LOST)"));
-#endif
-          systemState = SystemState::INIT;
-        }
-
-        break;
+    {
+      if (ibusCommLost) {
+        systemState = SystemState::INIT;
+        ibusStableStart_ms = 0;
       }
+      break;
+    }
 
+    // ------------------------------------------------
     case SystemState::FAULT:
+      // stay latched
+      break;
+
+    // ------------------------------------------------
     default:
+      // ENUM CORRUPTION HANDLER
+      latchFault(FaultCode::LOGIC_WATCHDOG);
+      systemState = SystemState::FAULT;
+      ibusStableStart_ms = 0;
       break;
   }
 }
@@ -2049,8 +2072,14 @@ void setup() {
   // --------------------------------------------------
   // READ LAST FAULT FROM EEPROM (FAULT HISTORY)
   // --------------------------------------------------
-  FaultCode lastFault;
-  EEPROM.get(100, lastFault);
+  uint8_t raw;
+EEPROM.get(100, raw);
+
+if (!isValidEnum<FaultCode>(raw)) {
+  raw = 0; // หรือ FaultCode::NONE
+}
+
+FaultCode lastFault = static_cast<FaultCode>(raw);
 
 #if DEBUG_SERIAL
   Serial.print(F("[BOOT] LAST FAULT = "));
@@ -2129,6 +2158,9 @@ void setup() {
   engineVolt = 0.0f;
 
   systemState = SystemState::INIT;
+  if (!isValidEnum<SystemState>(static_cast<uint8_t>(systemState))) {
+    systemState = SystemState::FAULT;
+  }
   driveState = DriveState::IDLE;
   bladeState = BladeState::IDLE;
   driveSafety = SafetyState::SAFE;
@@ -2310,10 +2342,9 @@ void loop() {
 
   telemetryCSV(now);
 
-  // ==================================================
-  // SUBSYSTEM WATCHDOG LAYER
-  // ==================================================
   monitorSubsystemWatchdogs(now);
+
+  backgroundFaultEEPROMTask(now);
 
   // ==================================================
   // LOOP OVERRUN GUARD

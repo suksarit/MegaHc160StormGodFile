@@ -102,7 +102,8 @@ void updateSafetyStability(
   uint32_t now,
   uint8_t& autoReverseCount,
   bool& autoReverseActive,
-  volatile DriveEvent& lastDriveEvent) {
+  DriveEvent& lastDriveEvent) {
+
   // --------------------------------------------------
   // PUBLISH RAW SAFETY
   // --------------------------------------------------
