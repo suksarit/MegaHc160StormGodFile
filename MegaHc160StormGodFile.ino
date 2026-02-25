@@ -169,6 +169,14 @@ FaultCode activeFault = FaultCode::NONE;
 bool faultLatched = false;
 
 // ============================================================================
+// EEPROM FAULT WRITE CONTROL (ANTI-WEAR PROTECTION)
+// ============================================================================
+constexpr uint8_t MAX_FAULT_WRITES_PER_BOOT = 8;     // จำกัดสูงสุดต่อ boot
+constexpr uint32_t FAULT_EEPROM_COOLDOWN_MS = 5000;  // เขียนได้ทุก 5 วินาที
+
+static uint8_t faultWriteCount = 0;
+static uint32_t lastFaultWriteMs = 0;
+// ============================================================================
 // SENSOR / CALIBRATION
 // ============================================================================
 constexpr uint32_t SENSOR_WARMUP_MS = 2000;
@@ -878,19 +886,54 @@ void driveSafe() {
 // ============================================================================
 void latchFault(FaultCode code) {
 
-  if (faultLatched) return;
+  if (faultLatched)
+    return;
 
   activeFault = code;
   faultLatched = true;
 
-  // ==================================================
-  // STORE LAST FAULT TO EEPROM (WRITE ONLY IF CHANGED)
-  // ==================================================
-  FaultCode lastStored;
-  EEPROM.get(100, lastStored);
+  uint32_t now = millis();
 
-  if (lastStored != code) {
-    EEPROM.put(100, code);
+  // ==================================================
+  // EEPROM WRITE PROTECTION LAYER
+  // ==================================================
+
+  bool allowWrite = true;
+
+  // 1️⃣ จำกัดจำนวนครั้งต่อ boot
+  if (faultWriteCount >= MAX_FAULT_WRITES_PER_BOOT) {
+    allowWrite = false;
+#if DEBUG_SERIAL
+    Serial.println(F("[EEPROM] WRITE LIMIT REACHED"));
+#endif
+  }
+
+  // 2️⃣ Cooldown กันเขียนถี่
+  if (allowWrite && (now - lastFaultWriteMs < FAULT_EEPROM_COOLDOWN_MS)) {
+    allowWrite = false;
+#if DEBUG_SERIAL
+    Serial.println(F("[EEPROM] WRITE COOLDOWN ACTIVE"));
+#endif
+  }
+
+  // 3️⃣ เขียนเฉพาะเมื่อ Fault เปลี่ยนจริง
+  if (allowWrite) {
+
+    FaultCode lastStored;
+    EEPROM.get(100, lastStored);
+
+    if (lastStored != code) {
+
+      EEPROM.put(100, code);
+
+      faultWriteCount++;
+      lastFaultWriteMs = now;
+
+#if DEBUG_SERIAL
+      Serial.print(F("[EEPROM] FAULT STORED: "));
+      Serial.println((uint8_t)code);
+#endif
+    }
   }
 
 #if DEBUG_SERIAL
@@ -1022,7 +1065,6 @@ void checkI2CBus(uint32_t now) {
     }
   }
 }
-
 
 // ============================================================================
 // NON-BLOCKING AUTO ZERO CURRENT CALIBRATION
@@ -1978,7 +2020,7 @@ void updateSystemState(uint32_t now) {
         }
 
         if (now - ibusStableStart_ms < 1000)
-          return;       
+          return;
 
         if (!calibrateCurrentOffsetNonBlocking(now))
           return;
