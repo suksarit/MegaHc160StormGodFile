@@ -237,6 +237,31 @@ constexpr uint32_t AUTO_REV_RESET_WINDOW_MS = 5000;
 
 Adafruit_ADS1115 adsCur;
 Adafruit_ADS1115 adsVolt;
+// ============================================================================
+// NON-BLOCKING CURRENT AUTO ZERO CALIBRATION
+// ============================================================================
+enum class ACSCalState : uint8_t {
+  IDLE,
+  START_CH,
+  WAIT_CONV,
+  NEXT_SAMPLE,
+  NEXT_CH,
+  DONE,
+  FAIL
+};
+
+ACSCalState acsCalState = ACSCalState::IDLE;
+
+bool currentOffsetCalibrated = false;
+
+constexpr uint8_t ACS_CAL_SAMPLE_N = 32;
+constexpr uint16_t ACS_CAL_TIMEOUT_MS = 400;
+
+uint8_t acsCalCh = 0;
+uint8_t acsCalSampleCnt = 0;
+int32_t acsCalSumRaw = 0;
+uint32_t acsCalStart_ms = 0;
+uint32_t acsCalConvStart_ms = 0;
 
 // LSB ต่อโวลต์ (GAIN = ±4.096V)
 constexpr float ADS1115_LSB_V = 4.096f / 32768.0f;  // ≈ 0.000125 V
@@ -996,6 +1021,136 @@ void checkI2CBus(uint32_t now) {
       latchFault(FaultCode::VOLT_SENSOR_FAULT);
     }
   }
+}
+
+
+// ============================================================================
+// NON-BLOCKING AUTO ZERO CURRENT CALIBRATION
+// RUN ONLY IN SystemState::INIT
+// ============================================================================
+bool calibrateCurrentOffsetNonBlocking(uint32_t now) {
+  if (currentOffsetCalibrated)
+    return true;
+
+  // ต้องอยู่ INIT และ drive ต้อง IDLE เท่านั้น
+  if (systemState != SystemState::INIT)
+    return false;
+
+  if (driveState != DriveState::IDLE)
+    return false;
+
+  // ตัด driver เพื่อความปลอดภัย
+  digitalWrite(PIN_DRV_ENABLE, LOW);
+  driveSafe();
+
+  switch (acsCalState) {
+    // --------------------------------------------------
+    case ACSCalState::IDLE:
+      acsCalCh = 0;
+      acsCalSampleCnt = 0;
+      acsCalSumRaw = 0;
+      acsCalStart_ms = now;
+      acsCalState = ACSCalState::START_CH;
+#if DEBUG_SERIAL
+      Serial.println(F("[ACS] CAL START"));
+#endif
+      break;
+
+    // --------------------------------------------------
+    case ACSCalState::START_CH:
+      {
+        if (now - acsCalStart_ms > ACS_CAL_TIMEOUT_MS) {
+          acsCalState = ACSCalState::FAIL;
+          break;
+        }
+
+        uint16_t mux =
+          ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[acsCalCh] << 12);
+
+        adsCur.startADCReading(mux, false);
+
+        acsCalConvStart_ms = now;
+        acsCalState = ACSCalState::WAIT_CONV;
+        break;
+      }
+
+    // --------------------------------------------------
+    case ACSCalState::WAIT_CONV:
+      {
+        if (adsCur.conversionComplete()) {
+          int16_t raw = adsCur.getLastConversionResults();
+          acsCalSumRaw += raw;
+          acsCalSampleCnt++;
+          acsCalState = ACSCalState::NEXT_SAMPLE;
+        } else if (now - acsCalConvStart_ms > 30) {
+          // conversion timeout
+          acsCalState = ACSCalState::FAIL;
+        }
+        break;
+      }
+
+    // --------------------------------------------------
+    case ACSCalState::NEXT_SAMPLE:
+      {
+        if (acsCalSampleCnt >= ACS_CAL_SAMPLE_N) {
+          int16_t avgRaw = acsCalSumRaw / ACS_CAL_SAMPLE_N;
+          float v = avgRaw * ADS1115_LSB_V;
+
+          // plausibility guard
+          if (v < 2.0f || v > 3.0f) {
+            acsCalState = ACSCalState::FAIL;
+            break;
+          }
+
+          g_acsOffsetV[acsCalCh] = v;
+
+#if DEBUG_SERIAL
+          Serial.print(F("[ACS] CH"));
+          Serial.print(acsCalCh);
+          Serial.print(F(" OFFSET="));
+          Serial.println(v, 4);
+#endif
+
+          acsCalState = ACSCalState::NEXT_CH;
+        } else {
+          acsCalState = ACSCalState::START_CH;
+        }
+        break;
+      }
+
+    // --------------------------------------------------
+    case ACSCalState::NEXT_CH:
+      {
+        acsCalCh++;
+        acsCalSampleCnt = 0;
+        acsCalSumRaw = 0;
+
+        if (acsCalCh >= 4) {
+          acsCalState = ACSCalState::DONE;
+        } else {
+          acsCalState = ACSCalState::START_CH;
+        }
+        break;
+      }
+
+    // --------------------------------------------------
+    case ACSCalState::DONE:
+      currentOffsetCalibrated = true;
+#if DEBUG_SERIAL
+      Serial.println(F("[ACS] CAL DONE"));
+#endif
+      return true;
+
+    // --------------------------------------------------
+    case ACSCalState::FAIL:
+#if DEBUG_SERIAL
+      Serial.println(F("[ACS] CAL FAIL"));
+#endif
+      latchFault(FaultCode::CUR_SENSOR_FAULT);
+      return false;
+  }
+
+  return false;
 }
 
 void updateSensors() {
@@ -1823,6 +1978,9 @@ void updateSystemState(uint32_t now) {
         }
 
         if (now - ibusStableStart_ms < 1000)
+          return;       
+
+        if (!calibrateCurrentOffsetNonBlocking(now))
           return;
 
         // ต้องกด RESET channel เพื่อ arm

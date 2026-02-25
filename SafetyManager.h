@@ -51,3 +51,5 @@ void updateSafetyStability(
   volatile DriveEvent& lastDriveEvent);
 
 #endif  // SAFETY_MANAGER_H
+
+

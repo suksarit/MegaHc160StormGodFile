@@ -407,3 +407,4 @@ bool Storm32Controller::isLocked() const {
 
   return hardDisabled || !systemEnabled || state == Storm32State::INIT || state == Storm32State::EMERGENCY;
 }
+
