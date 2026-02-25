@@ -1,9 +1,14 @@
 // ========================================================================================
-// SafetyManager.cpp  (TESTABLE / FIELD-SAFE)
+// SafetyManager.cpp  (TESTABLE / FIELD-SAFE / NO GLOBAL STATE)
 // ========================================================================================
 
 #include "SafetyManager.h"
 #include <Arduino.h>  // for max()
+
+// ============================================================================
+// INTERNAL SAFETY STATE (OWNED HERE ONLY)
+// ============================================================================
+static SafetyState driveSafetyInternal = SafetyState::SAFE;
 
 // ============================================================================
 // INTERNAL SAFETY STABILITY STATE (PRIVATE)
@@ -34,7 +39,8 @@ static constexpr uint32_t SAFE_STABLE_TIME_MS = 2000;
 // ============================================================================
 SafetyState evaluateSafetyRaw(
   const SafetyInput& in,
-  const SafetyThresholds& th) {
+  const SafetyThresholds& th)
+{
   // --------------------------------------------------
   // HARD FAULT ALWAYS WINS
   // --------------------------------------------------
@@ -51,8 +57,10 @@ SafetyState evaluateSafetyRaw(
   // --------------------------------------------------
   // LIMP CONDITION
   // --------------------------------------------------
-  if (curMax > th.CUR_LIMP_A || in.tempDriverL > th.TEMP_LIMP_C || in.tempDriverR > th.TEMP_LIMP_C) {
-
+  if (curMax > th.CUR_LIMP_A ||
+      in.tempDriverL > th.TEMP_LIMP_C ||
+      in.tempDriverR > th.TEMP_LIMP_C)
+  {
     warnCnt = 0;
 
     if (++limpCnt >= LIMP_CONFIRM_CNT) {
@@ -63,7 +71,9 @@ SafetyState evaluateSafetyRaw(
     return SafetyState::WARN;
   }
 
-  if (in.driveEvent == DriveEvent::STUCK_LEFT || in.driveEvent == DriveEvent::STUCK_RIGHT) {
+  if (in.driveEvent == DriveEvent::STUCK_LEFT ||
+      in.driveEvent == DriveEvent::STUCK_RIGHT)
+  {
     return SafetyState::LIMP;
   }
 
@@ -74,8 +84,10 @@ SafetyState evaluateSafetyRaw(
   // --------------------------------------------------
   // WARN CONDITION
   // --------------------------------------------------
-  if (curMax > th.CUR_WARN_A || in.tempDriverL > th.TEMP_WARN_C || in.tempDriverR > th.TEMP_WARN_C) {
-
+  if (curMax > th.CUR_WARN_A ||
+      in.tempDriverL > th.TEMP_WARN_C ||
+      in.tempDriverR > th.TEMP_WARN_C)
+  {
     limpCnt = 0;
 
     if (++warnCnt >= WARN_CONFIRM_CNT) {
@@ -102,12 +114,12 @@ void updateSafetyStability(
   uint32_t now,
   uint8_t& autoReverseCount,
   bool& autoReverseActive,
-  DriveEvent& lastDriveEvent) {
-
+  DriveEvent& lastDriveEvent)
+{
   // --------------------------------------------------
-  // PUBLISH RAW SAFETY
+  // PUBLISH RAW SAFETY (ENCAPSULATED)
   // --------------------------------------------------
-  driveSafety = raw;
+  driveSafetyInternal = raw;
 
   // --------------------------------------------------
   // NOT SAFE → RESET STABILITY
@@ -139,4 +151,18 @@ void updateSafetyStability(
     }
   }
 }
+
+// ============================================================================
+// PUBLIC ACCESSORS
+// ============================================================================
+SafetyState getDriveSafety()
+{
+  return driveSafetyInternal;
+}
+
+void forceSafetyState(SafetyState s)
+{
+  driveSafetyInternal = s;
+}
+
 

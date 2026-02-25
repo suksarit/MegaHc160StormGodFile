@@ -1,5 +1,5 @@
 // ========================================================================================
-// SafetyManager.h  (TESTABLE / FIELD-SAFE)
+// SafetyManager.h  (TESTABLE / FIELD-SAFE / NO GLOBAL STATE)
 // ========================================================================================
 
 #ifndef SAFETY_MANAGER_H
@@ -16,7 +16,7 @@ struct SafetyInput {
   int16_t tempDriverL;  // อุณหภูมิไดรเวอร์ซ้าย
   int16_t tempDriverR;  // อุณหภูมิไดรเวอร์ขวา
   bool faultLatched;    // fault ระดับระบบ
-   DriveEvent driveEvent; 
+  DriveEvent driveEvent;
 };
 
 // ============================================================================
@@ -30,26 +30,41 @@ struct SafetyThresholds {
 };
 
 // ============================================================================
-// PUBLIC RUNTIME STATE (OWNED BY SafetyManager)
-// ============================================================================
-extern SafetyState driveSafety;
-
-// ============================================================================
 // PUBLIC API
 // ============================================================================
 
-// PURE LOGIC: ไม่มี side-effect, ไม่มี global access
+// --------------------------------------------------------------------------
+// PURE LOGIC
+// ไม่มี side-effect
+// ไม่มี global access
+// ใช้สำหรับ unit test ได้โดยตรง
+// --------------------------------------------------------------------------
 SafetyState evaluateSafetyRaw(
   const SafetyInput& in,
   const SafetyThresholds& th);
 
-// STATE MACHINE: hysteresis + recovery control
+// --------------------------------------------------------------------------
+// STATE MACHINE
+// จัดการ hysteresis + stability timing
+// ไม่มี global extern อีกต่อไป
+// --------------------------------------------------------------------------
 void updateSafetyStability(
   SafetyState raw,
   uint32_t now,
   uint8_t& autoReverseCount,
   bool& autoReverseActive,
   DriveEvent& lastDriveEvent);
+
+// --------------------------------------------------------------------------
+// SAFETY STATE ACCESS (ENCAPSULATED)
+// --------------------------------------------------------------------------
+
+// อ่านค่า safety ปัจจุบัน (read-only access)
+SafetyState getDriveSafety();
+
+// ใช้เฉพาะกรณี system-level reset เช่น ignition fault reset
+void forceSafetyState(SafetyState s);
+
 #endif  // SAFETY_MANAGER_H
 
 
