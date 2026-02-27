@@ -302,6 +302,12 @@ WatchdogDomain wdDrive = { 0, 100, false };
 WatchdogDomain wdBlade = { 0, 100, false };
 
 // ============================================================================
+// LOOP OVERRUN CONFIRM (ANTI-TRANSIENT)
+// ============================================================================
+static uint8_t loopOverrunCnt = 0;
+constexpr uint8_t LOOP_OVERRUN_CONFIRM = 3;
+
+// ============================================================================
 // PWM CONFIG
 // ============================================================================
 #define PWM_TOP 1067  // 15 kHz
@@ -576,9 +582,9 @@ void detectWheelStuck(uint32_t now) {
   // ==================================================
   // CONFIG
   // ==================================================
-  constexpr int16_t MIN_PWM_FOR_STUCK = 300;     // ต้องมีแรงขับจริง
-  constexpr int16_t TURNING_DIFF_MAX  = 250;     // เกินนี้ถือว่าเลี้ยว
-  constexpr uint32_t STUCK_TIME_MS    = 80;      // ต้องต่อเนื่อง >= 80ms
+  constexpr int16_t MIN_PWM_FOR_STUCK = 300;  // ต้องมีแรงขับจริง
+  constexpr int16_t TURNING_DIFF_MAX = 250;   // เกินนี้ถือว่าเลี้ยว
+  constexpr uint32_t STUCK_TIME_MS = 80;      // ต้องต่อเนื่อง >= 80ms
 
   // ==================================================
   // ต้องมีแรงขับจริง
@@ -609,31 +615,29 @@ void detectWheelStuck(uint32_t now) {
   float percentThreshold;
 
   if (pwmMag < 400)
-    percentThreshold = 0.35f;   // ไวขึ้น
+    percentThreshold = 0.35f;  // ไวขึ้น
   else if (pwmMag < 700)
-    percentThreshold = 0.45f;   // สมดุล
+    percentThreshold = 0.45f;  // สมดุล
   else
-    percentThreshold = 0.55f;   // เข้มขึ้นที่ความเร็วสูง
+    percentThreshold = 0.55f;  // เข้มขึ้นที่ความเร็วสูง
 
   float diff = fabs(cL - cR);
   float percentDiff = diff / maxCur;
 
-  static uint32_t leftStart_ms  = 0;
+  static uint32_t leftStart_ms = 0;
   static uint32_t rightStart_ms = 0;
 
   // ==================================================
   // LEFT STUCK
   // ==================================================
-  if (cL > cR &&
-      percentDiff > percentThreshold &&
-      cL > CUR_LIMP_A) {
+  if (cL > cR && percentDiff > percentThreshold && cL > CUR_LIMP_A) {
 
     if (leftStart_ms == 0)
       leftStart_ms = now;
 
     if (now - leftStart_ms >= STUCK_TIME_MS) {
 
-      leftStart_ms  = 0;
+      leftStart_ms = 0;
       rightStart_ms = 0;
 
       lastDriveEvent = DriveEvent::STUCK_LEFT;
@@ -648,16 +652,14 @@ void detectWheelStuck(uint32_t now) {
   // ==================================================
   // RIGHT STUCK
   // ==================================================
-  if (cR > cL &&
-      percentDiff > percentThreshold &&
-      cR > CUR_LIMP_A) {
+  if (cR > cL && percentDiff > percentThreshold && cR > CUR_LIMP_A) {
 
     if (rightStart_ms == 0)
       rightStart_ms = now;
 
     if (now - rightStart_ms >= STUCK_TIME_MS) {
 
-      leftStart_ms  = 0;
+      leftStart_ms = 0;
       rightStart_ms = 0;
 
       lastDriveEvent = DriveEvent::STUCK_RIGHT;
@@ -671,13 +673,27 @@ void detectWheelStuck(uint32_t now) {
 }
 
 void detectWheelLock() {
+
   static uint8_t lockCnt = 0;
-  if (abs(targetL) < 200 && abs(targetR) < 200) {
+
+  // ==================================================
+  // ต้องมีแรงขับจริงจาก PWM output (ไม่ใช่ target)
+  // ==================================================
+  constexpr int16_t MIN_PWM_FOR_LOCK = 250;
+
+  if (abs(curL) < MIN_PWM_FOR_LOCK && abs(curR) < MIN_PWM_FOR_LOCK) {
+
     lockCnt = 0;
     return;
   }
+
+  // ==================================================
+  // BOTH SIDES HIGH CURRENT → POSSIBLE LOCK
+  // ==================================================
   if (curLeft() > CUR_LIMP_A && curRight() > CUR_LIMP_A) {
+
     if (++lockCnt >= 3) {
+
       lastDriveEvent = DriveEvent::WHEEL_LOCK;
       latchFault(FaultCode::OVER_CURRENT);
     }
@@ -747,48 +763,48 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   // =====================================================
   char line[400];
 
-// แปลง float เป็น int เพื่อเลี่ยง %f
-int volt_x10      = (int)(engineVolt * 10.0f);
-int curMax_x10    = (int)(curMax * 10.0f);
-int cpuLoad_x10   = (int)(cpuLoad * 10.0f);
-int cpuMargin_x10 = (int)(loopMargin * 10.0f);
+  // แปลง float เป็น int เพื่อเลี่ยง %f
+  int volt_x10 = (int)(engineVolt * 10.0f);
+  int curMax_x10 = (int)(curMax * 10.0f);
+  int cpuLoad_x10 = (int)(cpuLoad * 10.0f);
+  int cpuMargin_x10 = (int)(loopMargin * 10.0f);
 
-snprintf(line, sizeof(line),
-         "==============================\n"
-         "TEMP L/R   : %3d / %3d C\n"
-         "VOLT (24V) : %3d.%01d V\n"
-         "CURRENT MAX: %3d.%01d A\n"
-         "PWM L/R    : %4d / %4d\n"
-         "CPU LOAD   : %3d.%01d %%\n"
-         "CPU MARGIN : %3d.%01d %%\n"
-         "IBUS AGE   : %4lu ms\n"
-         "WATCHDOG   : S:%c C:%c D:%c B:%c\n"
-         "FAULT CODE : %2d\n"
-         "RAM FREE   : %5d B\n"
-         "AUTO REV   : %1d\n"
-         "SAFETY RAW : %1d\n"
-         "ADS CUR/V  : %c %c\n"
-         "GIMBAL ON  : %c\n"
-         "==============================",
-         tempDriverL,
-         tempDriverR,
-         volt_x10/10, abs(volt_x10%10),
-         curMax_x10/10, abs(curMax_x10%10),
-         curL,
-         curR,
-         cpuLoad_x10/10, abs(cpuLoad_x10%10),
-         cpuMargin_x10/10, abs(cpuMargin_x10%10),
-         (unsigned long)(now - lastIbusByte_ms),
-         wdS, wdC, wdD, wdB,
-         (uint8_t)activeFault,
-         freeRam(),
-         autoReverseCount,
-         (uint8_t)rawSafety,
-         adsCur,
-         adsVolt,
-         gimbalOn);
+  snprintf(line, sizeof(line),
+           "==============================\n"
+           "TEMP L/R   : %3d / %3d C\n"
+           "VOLT (24V) : %3d.%01d V\n"
+           "CURRENT MAX: %3d.%01d A\n"
+           "PWM L/R    : %4d / %4d\n"
+           "CPU LOAD   : %3d.%01d %%\n"
+           "CPU MARGIN : %3d.%01d %%\n"
+           "IBUS AGE   : %4lu ms\n"
+           "WATCHDOG   : S:%c C:%c D:%c B:%c\n"
+           "FAULT CODE : %2d\n"
+           "RAM FREE   : %5d B\n"
+           "AUTO REV   : %1d\n"
+           "SAFETY RAW : %1d\n"
+           "ADS CUR/V  : %c %c\n"
+           "GIMBAL ON  : %c\n"
+           "==============================",
+           tempDriverL,
+           tempDriverR,
+           volt_x10 / 10, abs(volt_x10 % 10),
+           curMax_x10 / 10, abs(curMax_x10 % 10),
+           curL,
+           curR,
+           cpuLoad_x10 / 10, abs(cpuLoad_x10 % 10),
+           cpuMargin_x10 / 10, abs(cpuMargin_x10 % 10),
+           (unsigned long)(now - lastIbusByte_ms),
+           wdS, wdC, wdD, wdB,
+           (uint8_t)activeFault,
+           freeRam(),
+           autoReverseCount,
+           (uint8_t)rawSafety,
+           adsCur,
+           adsVolt,
+           gimbalOn);
 
-Serial.println(line);
+  Serial.println(line);
 
 #endif
 }
@@ -1352,6 +1368,7 @@ void updateSensors() {
   static uint8_t i2cResetCount = 0;
 
   if (Wire.getWireTimeoutFlag() && i2cState == I2CRecoverState::IDLE) {
+
     Wire.clearWireTimeoutFlag();
     i2cState = I2CRecoverState::END_BUS;
     i2cStateStart_ms = now;
@@ -1359,19 +1376,33 @@ void updateSensors() {
 
   switch (i2cState) {
 
+    // --------------------------------------------------
     case I2CRecoverState::END_BUS:
-      Wire.end();
-      return;  // ❗ recovery phase → ไม่ feed
 
+      Wire.end();
+
+      i2cState = I2CRecoverState::BEGIN_BUS;
+      i2cStateStart_ms = now;
+
+      return;  // recovery phase → skip sensor feed
+
+
+    // --------------------------------------------------
     case I2CRecoverState::BEGIN_BUS:
-      if (now - i2cStateStart_ms >= 1) {
-        Wire.begin();
-        Wire.setClock(100000);
-        Wire.setWireTimeout(6000, true);
-        i2cState = I2CRecoverState::REINIT_ADS;
-      }
+
+      // หน่วง 1ms ให้ bus settle
+      if (now - i2cStateStart_ms < 1)
+        return;
+
+      Wire.begin();
+      Wire.setClock(100000);
+      Wire.setWireTimeout(6000, true);
+
+      i2cState = I2CRecoverState::REINIT_ADS;
       return;
 
+
+    // --------------------------------------------------
     case I2CRecoverState::REINIT_ADS:
 
       adsCurPresent = adsCur.begin(0x48);
@@ -1390,12 +1421,17 @@ void updateSensors() {
       i2cState = I2CRecoverState::DONE;
       return;
 
+
+    // --------------------------------------------------
     case I2CRecoverState::DONE:
+
       if (i2cResetCount >= 3) {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
       }
+
       i2cState = I2CRecoverState::IDLE;
       return;
+
 
     default:
       break;
@@ -1423,8 +1459,7 @@ void updateSensors() {
     if (!curConvRunning) {
 
       uint16_t mux =
-        ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
-        (ADS_CUR_CH_MAP[curIdx] << 12);
+        ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[curIdx] << 12);
 
       adsCur.startADCReading(mux, false);
       curConvRunning = true;
@@ -1443,10 +1478,9 @@ void updateSensors() {
           return;
         }
 
-        curA[curIdx] += CUR_LPF_ALPHA *
-                        (a - curA[curIdx]);
+        curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
 
-        sensorHealthyThisCycle = true;   // ✔ current OK
+        sensorHealthyThisCycle = true;  // ✔ current OK
 
         if (a > CUR_SPIKE_A) {
           forceDriveSoftStop(now);
@@ -1506,17 +1540,15 @@ void updateSensors() {
 
         if (vRaw > 0.0f && vRaw < 40.0f) {
 
-          engineVolt += 0.15f *
-            (vRaw - engineVolt);
+          engineVolt += 0.15f * (vRaw - engineVolt);
 
           lastVoltOk_ms = now;
-          sensorHealthyThisCycle = true;   // ✔ voltage OK
+          sensorHealthyThisCycle = true;  // ✔ voltage OK
         }
 
         voltConvRunning = false;
 
-      } else if (now - voltConvStart_ms >
-                 VOLT_CONV_TIMEOUT_MS) {
+      } else if (now - voltConvStart_ms > VOLT_CONV_TIMEOUT_MS) {
 
         voltConvRunning = false;
       }
@@ -1557,18 +1589,16 @@ void updateSensors() {
     tempDriverR = tR;
     lastTempOk_ms = now;
 
-    sensorHealthyThisCycle = true;   // ✔ temp OK
+    sensorHealthyThisCycle = true;  // ✔ temp OK
 
-    if (tL > TEMP_TRIP_C ||
-        tR > TEMP_TRIP_C) {
+    if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C) {
 
       latchFault(FaultCode::OVER_TEMP);
       return;
     }
   }
 
-  if (now - lastTempOk_ms >
-      TEMP_SENSOR_TIMEOUT_MS) {
+  if (now - lastTempOk_ms > TEMP_SENSOR_TIMEOUT_MS) {
 
     latchFault(FaultCode::TEMP_SENSOR_FAULT);
     return;
@@ -1577,9 +1607,24 @@ void updateSensors() {
 #endif
 
   // ==================================================
-  // FEED SENSOR WATCHDOG ONLY IF SENSOR REALLY WORKED
+  // SENSOR SUBSYSTEM WATCHDOG FEED (ROBUST VERSION)
+  // Feed when subsystem is alive, not only when conversion finished
   // ==================================================
-  if (sensorHealthyThisCycle && !faultLatched) {
+  bool sensorSubsystemAlive = false;
+
+  // ถ้าไม่ได้อยู่ใน recovery phase
+  if (i2cState == I2CRecoverState::IDLE) {
+
+    // มี sensor อย่างน้อย 1 ตัว online
+    if (adsCurPresent || adsVoltPresent) {
+      sensorSubsystemAlive = true;
+    }
+  }
+
+  // Feed watchdog only if:
+  // - subsystem alive
+  // - no system fault latched
+  if (sensorSubsystemAlive && !faultLatched) {
     wdSensor.lastUpdate_ms = now;
   }
 }
@@ -1806,8 +1851,7 @@ void applyDrive() {
       setPWM_R(AUTO_REV_PWM);
 
       return;
-    }
-    else {
+    } else {
       autoReverseActive = false;
 #if DEBUG_SERIAL
       Serial.println(F("[AUTO REV] END"));
@@ -1836,12 +1880,10 @@ void applyDrive() {
   // DIRECTION CHANGE DEAD-TIME (USE FINAL TARGET)
   // ==================================================
   bool wantRevL =
-    (curL > 0 && finalTargetL < 0) ||
-    (curL < 0 && finalTargetL > 0);
+    (curL > 0 && finalTargetL < 0) || (curL < 0 && finalTargetL > 0);
 
   bool wantRevR =
-    (curR > 0 && finalTargetR < 0) ||
-    (curR < 0 && finalTargetR > 0);
+    (curR > 0 && finalTargetR < 0) || (curR < 0 && finalTargetR > 0);
 
   if (wantRevL && revBlockUntilL == 0)
     revBlockUntilL = now + REVERSE_DEADTIME_MS;
@@ -2601,10 +2643,6 @@ void loop() {
     backgroundFaultEEPROMTask(now);
     monitorSubsystemWatchdogs(now);
 
-    if (micros() - loopStart_us > BUDGET_LOOP_MS * 1000UL) {
-      latchFault(FaultCode::LOOP_OVERRUN);
-    }
-
 #if TELEMETRY_CSV
     telemetryCSV(now, loopStart_us);  // << ย้ายมาไว้ก่อน return
 #endif
@@ -2654,10 +2692,27 @@ void loop() {
   backgroundFaultEEPROMTask(now);
 
   // ==================================================
-  // LOOP OVERRUN GUARD
+  // LOOP OVERRUN CONFIRM (SINGLE POINT / FIELD SAFE)
   // ==================================================
-  if (micros() - loopStart_us > BUDGET_LOOP_MS * 1000UL) {
-    latchFault(FaultCode::LOOP_OVERRUN);
+  {
+    uint32_t loopTime_us = micros() - loopStart_us;
+    uint32_t loopBudget_us = BUDGET_LOOP_MS * 1000UL;
+
+    if (loopTime_us > loopBudget_us) {
+
+      if (++loopOverrunCnt >= LOOP_OVERRUN_CONFIRM) {
+
+#if DEBUG_SERIAL
+        Serial.println(F("[FAULT] LOOP OVERRUN CONFIRMED"));
+#endif
+
+        latchFault(FaultCode::LOOP_OVERRUN);
+      }
+
+    } else {
+
+      loopOverrunCnt = 0;
+    }
   }
 
   // ==================================================
@@ -2705,5 +2760,3 @@ void loop() {
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
 }
-
-
