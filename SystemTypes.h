@@ -1,5 +1,5 @@
 // ========================================================================================
-// SystemTypes.h  (FINAL - SAFE / AVR COMPATIBLE)
+// SystemTypes.h  (FINAL - SAFE / AVR COMPATIBLE / EXTENDABLE)
 // ========================================================================================
 
 #pragma once
@@ -65,24 +65,38 @@ enum class BladeState : uint8_t {
   _COUNT
 };
 
+// ============================================================================
+// FAULT CODE (EXTENDABLE / EEPROM SAFE)
+// ลำดับห้ามสลับ ถ้าใช้งาน EEPROM ใน field แล้ว
+// เพิ่มใหม่ให้ใส่ก่อน _COUNT เสมอ
+// ============================================================================
 enum class FaultCode : uint8_t {
   NONE = 0,
+
   IBUS_LOST,
   COMMS_TIMEOUT,
+
+  SENSOR_TIMEOUT,      // <<< เพิ่มตรงนี้
+
   LOGIC_WATCHDOG,
+
   CUR_SENSOR_FAULT,
   VOLT_SENSOR_FAULT,
   TEMP_SENSOR_FAULT,
+
   OVER_CURRENT,
   OVER_TEMP,
+
   DRIVE_TIMEOUT,
   BLADE_TIMEOUT,
+
   LOOP_OVERRUN,
+
   _COUNT
 };
 
 // ============================================================================
-// ENUM VALIDATION
+// ENUM VALIDATION (GENERIC / SAFE)
 // ============================================================================
 template<typename E>
 inline bool isValidEnum(uint8_t raw) {
@@ -90,6 +104,3 @@ inline bool isValidEnum(uint8_t raw) {
 }
 
 #endif
-
-
-

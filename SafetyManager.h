@@ -1,15 +1,16 @@
 // ========================================================================================
 // SafetyManager.h  (PURE RAW + STABILITY LAYER SEPARATED)
+// INDUSTRIAL SAFE VERSION - ENUM EXTENDABLE
 // ========================================================================================
 
 #ifndef SAFETY_MANAGER_H
 #define SAFETY_MANAGER_H
 
 #include <stdint.h>
-#include "SystemTypes.h"  // SafetyState, DriveEvent
+#include "SystemTypes.h"   // SafetyState, DriveEvent
 
 // ============================================================================
-// SAFETY INPUT SNAPSHOT (PURE DATA)
+// SAFETY INPUT SNAPSHOT (PURE DATA - NO SIDE EFFECT)
 // ============================================================================
 struct SafetyInput {
   float curA[4];        // กระแสแต่ละช่อง
@@ -20,7 +21,7 @@ struct SafetyInput {
 };
 
 // ============================================================================
-// SAFETY THRESHOLDS (INJECTABLE)
+// SAFETY THRESHOLDS (INJECTABLE / TESTABLE)
 // ============================================================================
 struct SafetyThresholds {
   int16_t CUR_WARN_A;
@@ -30,14 +31,19 @@ struct SafetyThresholds {
 };
 
 // ============================================================================
-// PURE RAW LOGIC (NO STATE / NO STATIC / NO SIDE EFFECT)
+// PURE RAW SAFETY EVALUATION
+// - ไม่มี static
+// - ไม่มี global
+// - deterministic 100%
 // ============================================================================
 SafetyState evaluateSafetyRaw(
   const SafetyInput& in,
   const SafetyThresholds& th);
 
 // ============================================================================
-// STABILITY + HYSTERESIS LAYER
+// STABILITY LAYER (HYSTERESIS / ANTI-FLAP)
+// - มี internal static
+// - ไม่ยุ่งกับ hardware
 // ============================================================================
 void updateSafetyStability(
   SafetyState raw,
@@ -47,10 +53,14 @@ void updateSafetyStability(
   DriveEvent& lastDriveEvent);
 
 // ============================================================================
-// ACCESSORS
+// ACCESSORS (GLOBAL SAFETY STATE)
 // ============================================================================
 SafetyState getDriveSafety();
 void forceSafetyState(SafetyState s);
 
-#endif
+// ============================================================================
+// OPTIONAL: STRING CONVERSION (FOR DEBUG / LOG)
+// ============================================================================
+const char* safetyStateToString(SafetyState s);
 
+#endif

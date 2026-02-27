@@ -90,7 +90,7 @@ constexpr uint8_t CH_STARTER = 10;
 // ============================================================================
 bool readDriverTempsPT100(int &tL, int &tR);
 float readCurrentADC(uint8_t adsChannel, uint8_t idx);
-void updateSensors(void);
+bool updateSensors(void);
 void latchFault(FaultCode code);
 void updateDriverFans(void);
 void setFanPWM_L(uint8_t pwm);
@@ -302,10 +302,23 @@ WatchdogDomain wdDrive = { 0, 100, false };
 WatchdogDomain wdBlade = { 0, 100, false };
 
 // ============================================================================
-// LOOP OVERRUN CONFIRM (ANTI-TRANSIENT)
+// INDUSTRIAL LOOP TIMING SUPERVISOR
 // ============================================================================
-static uint8_t loopOverrunCnt = 0;
-constexpr uint8_t LOOP_OVERRUN_CONFIRM = 3;
+static int32_t loopOverrunAccum_us = 0;
+
+// ============================================================================
+// PHASE BUDGET CONFIRM (GLOBAL)
+// ============================================================================
+uint8_t commsBudgetCnt = 0;
+uint8_t driveBudgetCnt = 0;
+uint8_t bladeBudgetCnt = 0;
+
+constexpr uint8_t PHASE_BUDGET_CONFIRM = 3;
+
+constexpr int32_t LOOP_OVERRUN_FAULT_US = 40000;   // sustained overload
+constexpr int32_t LOOP_OVERRUN_RECOVER_US = 2000;  // decay per healthy loop
+constexpr uint32_t LOOP_HARD_LIMIT_US =
+  BUDGET_LOOP_MS * 2000UL;  // 2x budget immediate kill
 
 // ============================================================================
 // PWM CONFIG
@@ -1326,7 +1339,7 @@ bool calibrateCurrentOffsetNonBlocking(uint32_t now) {
   return false;
 }
 
-void updateSensors() {
+bool updateSensors() {
 
   uint32_t now = millis();
 
@@ -1613,20 +1626,20 @@ void updateSensors() {
   bool sensorSubsystemAlive = false;
 
   // ถ้าไม่ได้อยู่ใน recovery phase
+  // ==================================================
+  // SENSOR SUBSYSTEM ALIVE DECISION
+  // ==================================================
   if (i2cState == I2CRecoverState::IDLE) {
 
-    // มี sensor อย่างน้อย 1 ตัว online
     if (adsCurPresent || adsVoltPresent) {
-      sensorSubsystemAlive = true;
+
+      if (sensorHealthyThisCycle) {
+        return true;  // sensor subsystem healthy
+      }
     }
   }
 
-  // Feed watchdog only if:
-  // - subsystem alive
-  // - no system fault latched
-  if (sensorSubsystemAlive && !faultLatched) {
-    wdSensor.lastUpdate_ms = now;
-  }
+  return false;  // sensor not healthy
 }
 
 void runDrive(uint32_t now) {
@@ -1740,11 +1753,6 @@ void runDrive(uint32_t now) {
 
     lastDriveState = driveState;
   }
-
-  // ===================================================
-  // DRIVE WATCHDOG FEED
-  // ===================================================
-  wdDrive.lastUpdate_ms = now;
 }
 
 // ============================================================================
@@ -1784,8 +1792,6 @@ void runBlade(uint32_t now) {
       bladeServo.writeMicroseconds(1000);
       break;
   }
-
-  wdBlade.lastUpdate_ms = now;
 }
 
 void monitorSubsystemWatchdogs(uint32_t now) {
@@ -2552,14 +2558,9 @@ void setup() {
 
 void loop() {
 
-  wdt_reset();
-
   uint32_t now = millis();
   uint32_t loopStart_us = micros();
 
-  // ==================================================
-  // DEBUG ONLY (เมื่อไม่ได้ใช้ TELEMETRY_CSV)
-  // ==================================================
 #if DEBUG_SERIAL && !TELEMETRY_CSV
   debugTestMode(now);
   debugTelemetry(now);
@@ -2575,21 +2576,46 @@ void loop() {
   updateIgnition();
   updateSystemState(now);
 
-  if (micros() - tComms_us > BUDGET_COMMS_MS * 1000UL) {
-    latchFault(FaultCode::COMMS_TIMEOUT);
+  uint32_t dtComms = micros() - tComms_us;
+
+  if (dtComms > BUDGET_COMMS_MS * 1000UL) {
+
+    if (++commsBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::COMMS_TIMEOUT);
+
+  } else {
+
+    commsBudgetCnt = 0;
   }
 
   // ==================================================
   // PHASE 2 : SENSORS
   // ==================================================
-  updateSensors();
+  uint32_t tSensor_us = micros();
 
-  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
-    latchFault(FaultCode::LOGIC_WATCHDOG);
+  bool sensorAlive = updateSensors();
+
+  uint32_t dtSensor = micros() - tSensor_us;
+
+  // -------- PHASE BUDGET CONFIRM --------
+  static uint8_t sensorBudgetCnt = 0;
+
+  if (dtSensor > BUDGET_SENSORS_MS * 1000UL) {
+
+    if (++sensorBudgetCnt >= PHASE_BUDGET_CONFIRM) {
+      latchFault(FaultCode::SENSOR_TIMEOUT);
+    }
+
+  } else {
+
+    sensorBudgetCnt = 0;
+
+    // Feed watchdog only when sensor subsystem alive
+    if (sensorAlive) {
+      wdSensor.lastUpdate_ms = now;
+    }
   }
-
   updateEngineState(now);
-
   detectSideImbalanceAndSteer();
   detectWheelStuck(now);
   detectWheelLock();
@@ -2620,12 +2646,8 @@ void loop() {
     autoReverseActive,
     lastDriveEvent);
 
-  // ==================================================
-  // SYSTEM STATE UPDATE
-  // ==================================================
-  if (faultLatched) {
+  if (faultLatched)
     systemState = SystemState::FAULT;
-  }
 
   processFaultReset(now);
 
@@ -2633,7 +2655,7 @@ void loop() {
     (systemState == SystemState::FAULT) || (getDriveSafety() == SafetyState::EMERGENCY);
 
   // ==================================================
-  // SYSTEM GATE (EMERGENCY BOUNDARY)
+  // SYSTEM GATE
   // ==================================================
   if (systemState != SystemState::ACTIVE || emergencyActive) {
 
@@ -2644,7 +2666,7 @@ void loop() {
     monitorSubsystemWatchdogs(now);
 
 #if TELEMETRY_CSV
-    telemetryCSV(now, loopStart_us);  // << ย้ายมาไว้ก่อน return
+    telemetryCSV(now, loopStart_us);
 #endif
 
     digitalWrite(PIN_HW_WD_HB,
@@ -2658,19 +2680,41 @@ void loop() {
   // ==================================================
   uint32_t tDrive_us = micros();
   runDrive(now);
+  applyDrive();
+  uint32_t dtDrive = micros() - tDrive_us;
 
-  if (micros() - tDrive_us > BUDGET_DRIVE_MS * 1000UL) {
-    latchFault(FaultCode::DRIVE_TIMEOUT);
+  if (dtDrive > BUDGET_DRIVE_MS * 1000UL) {
+
+    if (++driveBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::DRIVE_TIMEOUT);
+
+  } else {
+
+    driveBudgetCnt = 0;
+
+    // ✔ Feed watchdog only when drive phase healthy
+    wdDrive.lastUpdate_ms = now;
   }
 
+  // ==================================================
+  // PHASE 3B : BLADE
+  // ==================================================
   uint32_t tBlade_us = micros();
   runBlade(now);
+  uint32_t dtBlade = micros() - tBlade_us;
 
-  if (micros() - tBlade_us > BUDGET_BLADE_MS * 1000UL) {
-    latchFault(FaultCode::BLADE_TIMEOUT);
+  if (dtBlade > BUDGET_BLADE_MS * 1000UL) {
+
+    if (++bladeBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::BLADE_TIMEOUT);
+
+  } else {
+
+    bladeBudgetCnt = 0;
+
+    // ✔ Feed watchdog only when blade phase healthy
+    wdBlade.lastUpdate_ms = now;
   }
-
-  applyDrive();
 
   // ==================================================
   // PHASE 4 : AUX
@@ -2692,26 +2736,34 @@ void loop() {
   backgroundFaultEEPROMTask(now);
 
   // ==================================================
-  // LOOP OVERRUN CONFIRM (SINGLE POINT / FIELD SAFE)
+  // INDUSTRIAL LOOP TIMING SUPERVISOR
   // ==================================================
   {
     uint32_t loopTime_us = micros() - loopStart_us;
     uint32_t loopBudget_us = BUDGET_LOOP_MS * 1000UL;
 
+    // HARD LIMIT
+    if (loopTime_us > LOOP_HARD_LIMIT_US) {
+      latchFault(FaultCode::LOOP_OVERRUN);
+    }
+
+    // ACCUMULATION
     if (loopTime_us > loopBudget_us) {
 
-      if (++loopOverrunCnt >= LOOP_OVERRUN_CONFIRM) {
-
-#if DEBUG_SERIAL
-        Serial.println(F("[FAULT] LOOP OVERRUN CONFIRMED"));
-#endif
-
-        latchFault(FaultCode::LOOP_OVERRUN);
-      }
+      loopOverrunAccum_us +=
+        (loopTime_us - loopBudget_us);
 
     } else {
 
-      loopOverrunCnt = 0;
+      loopOverrunAccum_us -= LOOP_OVERRUN_RECOVER_US;
+
+      if (loopOverrunAccum_us < 0)
+        loopOverrunAccum_us = 0;
+    }
+
+    // SUSTAINED OVERLOAD
+    if (loopOverrunAccum_us > LOOP_OVERRUN_FAULT_US) {
+      latchFault(FaultCode::LOOP_OVERRUN);
     }
   }
 
@@ -2747,16 +2799,12 @@ void loop() {
     digitalWrite(PIN_DRV_ENABLE, LOW);
   }
 
-  // ==================================================
-  // TELEMETRY (FULL LOOP CPU LOAD)
-  // ==================================================
 #if TELEMETRY_CSV
   telemetryCSV(now, loopStart_us);
 #endif
 
-  // ==================================================
-  // HEARTBEAT
-  // ==================================================
+  wdt_reset();
+
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
 }
