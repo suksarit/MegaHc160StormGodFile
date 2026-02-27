@@ -65,6 +65,22 @@ enum class BladeState : uint8_t {
   _COUNT
 };
 
+enum class FaultCode : uint8_t {
+  NONE = 0,
+  IBUS_LOST,
+  COMMS_TIMEOUT,
+  LOGIC_WATCHDOG,
+  CUR_SENSOR_FAULT,
+  VOLT_SENSOR_FAULT,
+  TEMP_SENSOR_FAULT,
+  OVER_CURRENT,
+  OVER_TEMP,
+  DRIVE_TIMEOUT,
+  BLADE_TIMEOUT,
+  LOOP_OVERRUN,
+  _COUNT
+};
+
 // ============================================================================
 // ENUM VALIDATION
 // ============================================================================

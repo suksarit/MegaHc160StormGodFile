@@ -85,21 +85,6 @@ constexpr uint8_t CH_STARTER = 10;
 #define BUDGET_BLADE_MS 2
 #define BUDGET_LOOP_MS 20
 
-enum class FaultCode : uint8_t {
-  NONE = 0,
-  IBUS_LOST,
-  COMMS_TIMEOUT,
-  LOGIC_WATCHDOG,
-  CUR_SENSOR_FAULT,
-  VOLT_SENSOR_FAULT,
-  TEMP_SENSOR_FAULT,
-  OVER_CURRENT,
-  OVER_TEMP,
-  DRIVE_TIMEOUT,
-  BLADE_TIMEOUT,
-  LOOP_OVERRUN,
-  _COUNT
-};
 
 // ============================================================================
 // FUNCTION PROTOTYPES (FINAL / MATCH ARDUINO ABI)
