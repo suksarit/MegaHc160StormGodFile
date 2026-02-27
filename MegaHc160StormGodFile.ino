@@ -85,7 +85,6 @@ constexpr uint8_t CH_STARTER = 10;
 #define BUDGET_BLADE_MS 2
 #define BUDGET_LOOP_MS 20
 
-
 // ============================================================================
 // FUNCTION PROTOTYPES (FINAL / MATCH ARDUINO ABI)
 // ============================================================================
@@ -138,7 +137,6 @@ constexpr uint32_t ENGINE_CONFIRM_MS = 900;
 
 constexpr uint8_t MAX_AUTO_REVERSE = 2;
 uint8_t autoReverseCount = 0;
-
 
 // ============================================================================
 // FAULT CONTROL (NO SENSOR STALL)
@@ -350,6 +348,20 @@ constexpr uint8_t VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอ
 // ============================================================================
 // UTIL
 // ============================================================================
+
+// ======================================================
+// FREE RAM (SRAM MONITOR)
+// ======================================================
+extern unsigned int __heap_start;
+extern void* __brkval;
+
+int freeRam() {
+  int v;
+  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
+
+// ------------------------------------------------------
+
 inline bool neutral(uint16_t v) {
   return (v > 1450 && v < 1550);
 }
@@ -556,42 +568,112 @@ void detectWheelLock() {
   }
 }
 
-void telemetryCSV(uint32_t now) {
+void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
+
 #if TELEMETRY_CSV
+
   static uint32_t lastTx = 0;
   if (now - lastTx < TELEMETRY_PERIOD_MS) return;
   lastTx = now;
-  float curMax = max(max(curA[0], curA[1]), max(curA[2], curA[3]));
-  float v24 = engineVolt;
-  // ===== CSV FORMAT =====
-  // time,curL1,curL2,curR1,curR2,curMax,tempDL,tempDR,volt,pwmL,pwmR,driveState,safety
-  Serial.print(now);
-  Serial.print(',');
-  Serial.print(curA[0], 2);
-  Serial.print(',');
-  Serial.print(curA[1], 2);
-  Serial.print(',');
-  Serial.print(curA[2], 2);
-  Serial.print(',');
-  Serial.print(curA[3], 2);
-  Serial.print(',');
-  Serial.print(curMax, 2);
-  Serial.print(',');
-  Serial.print(tempDriverL);
-  Serial.print(',');
-  Serial.print(tempDriverR);
-  Serial.print(',');
-  Serial.print(v24, 2);
-  Serial.print(',');
-  Serial.print(curL);
-  Serial.print(',');
-  Serial.print(curR);
-  Serial.print(',');
-  Serial.print((uint8_t)driveState);
-  Serial.print(',');
-  Serial.print((uint8_t)getDriveSafety());
-  Serial.print(',');
-  Serial.println((uint8_t)lastDriveEvent);
+
+  // =====================================================
+  // LOOP TIMING
+  // =====================================================
+  uint32_t loopTime_us = micros() - loopStart_us;
+  float loopBudget_us = BUDGET_LOOP_MS * 1000.0f;
+
+  float cpuLoad = (loopTime_us / loopBudget_us) * 100.0f;
+  if (cpuLoad > 999.0f) cpuLoad = 999.0f;
+
+  float loopMargin = 100.0f - cpuLoad;
+  if (loopMargin < -999.0f) loopMargin = -999.0f;
+
+  // =====================================================
+  // CURRENT
+  // =====================================================
+  float curMax = max(max(curA[0], curA[1]),
+                     max(curA[2], curA[3]));
+
+  // =====================================================
+  // WATCHDOG STATUS
+  // =====================================================
+  char wdS = wdSensor.faulted ? 'X' : 'O';
+  char wdC = wdComms.faulted  ? 'X' : 'O';
+  char wdD = wdDrive.faulted  ? 'X' : 'O';
+  char wdB = wdBlade.faulted  ? 'X' : 'O';
+
+  // =====================================================
+  // ADS FLAGS
+  // =====================================================
+  char adsCur = adsCurPresent ? '1' : '0';
+  char adsVolt = adsVoltPresent ? '1' : '0';
+
+  // =====================================================
+  // GIMBAL STATE
+  // =====================================================
+  char gimbalOn =
+    (systemState == SystemState::ACTIVE &&
+     !faultLatched &&
+     !requireIbusConfirm) ? '1' : '0';
+
+  // =====================================================
+  // SAFETY RAW STATE
+  // =====================================================
+  SafetyInput sin;
+  memcpy(sin.curA, curA, sizeof(curA));
+  sin.tempDriverL = tempDriverL;
+  sin.tempDriverR = tempDriverR;
+  sin.faultLatched = faultLatched;
+  sin.driveEvent = lastDriveEvent;
+
+  SafetyThresholds sth = {
+    CUR_WARN_A,
+    CUR_LIMP_A,
+    TEMP_WARN_C,
+    TEMP_LIMP_C
+  };
+
+  SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
+
+  // =====================================================
+  // DASHBOARD
+  // =====================================================
+  char line[260];
+
+  snprintf(line, sizeof(line),
+           "\r"
+           "TL:%3d TR:%3d | "
+           "V:%5.1f | "
+           "I:%6.1f | "
+           "PWM:%4d/%4d | "
+           "CPU:%6.1f%% M:%6.1f%% | "
+           "IB:%4lu | "
+           "WD:%c%c%c%c | "
+           "F:%2d | "
+           "RAM:%5d | "
+           "AR:%1d | "
+           "SR:%1d | "
+           "ADS:%c%c | "
+           "G:%c ",
+           tempDriverL,
+           tempDriverR,
+           engineVolt,
+           curMax,
+           curL,
+           curR,
+           cpuLoad,
+           loopMargin,
+           (unsigned long)(now - lastIbusByte_ms),
+           wdS, wdC, wdD, wdB,
+           (uint8_t)activeFault,
+           freeRam(),
+           autoReverseCount,
+           (uint8_t)rawSafety,
+           adsCur,
+           adsVolt,
+           gimbalOn);
+
+  Serial.print(line);
 
 #endif
 }
@@ -2316,16 +2398,12 @@ void loop() {
   uint32_t loopStart_us = micros();
 
   // ==================================================
-  // DEBUG / TELEMETRY (MUTUALLY EXCLUSIVE)
+  // DEBUG ONLY (เมื่อไม่ได้ใช้ TELEMETRY_CSV)
   // ==================================================
 #if DEBUG_SERIAL && !TELEMETRY_CSV
   debugTestMode(now);
   debugTelemetry(now);
   debugIBus(now);
-#endif
-
-#if TELEMETRY_CSV
-  telemetryCSV(now);
 #endif
 
   // ==================================================
@@ -2392,7 +2470,8 @@ void loop() {
   processFaultReset(now);
 
   bool emergencyActive =
-    (systemState == SystemState::FAULT) || (getDriveSafety() == SafetyState::EMERGENCY);
+    (systemState == SystemState::FAULT) ||
+    (getDriveSafety() == SafetyState::EMERGENCY);
 
   // ==================================================
   // SYSTEM GATE (EMERGENCY BOUNDARY)
@@ -2402,18 +2481,17 @@ void loop() {
     handleFaultImmediateCut();
     digitalWrite(PIN_DRV_ENABLE, LOW);
 
-    // ----- Background tasks MUST run even in fault -----
     backgroundFaultEEPROMTask(now);
-
-    // ----- Watchdog domains still monitored -----
     monitorSubsystemWatchdogs(now);
 
-    // ----- Loop overrun guard still active -----
     if (micros() - loopStart_us > BUDGET_LOOP_MS * 1000UL) {
       latchFault(FaultCode::LOOP_OVERRUN);
     }
 
-    // ----- Heartbeat -----
+#if TELEMETRY_CSV
+    telemetryCSV(now, loopStart_us);   // << ย้ายมาไว้ก่อน return
+#endif
+
     digitalWrite(PIN_HW_WD_HB,
                  !digitalRead(PIN_HW_WD_HB));
 
@@ -2448,7 +2526,9 @@ void loop() {
   updateStarter(now);
 
   gimbal.setSystemEnabled(
-    systemState == SystemState::ACTIVE && !emergencyActive && !requireIbusConfirm);
+    systemState == SystemState::ACTIVE &&
+    !emergencyActive &&
+    !requireIbusConfirm);
 
   gimbal.update(now);
 
@@ -2471,10 +2551,13 @@ void loop() {
   static uint32_t driveEnableArmStart_ms = 0;
 
   bool runAllowed =
-    (driveState == DriveState::RUN || driveState == DriveState::LIMP);
+    (driveState == DriveState::RUN ||
+     driveState == DriveState::LIMP);
 
   bool hardCut =
-    emergencyActive || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
+    emergencyActive ||
+    (driveState == DriveState::SOFT_STOP) ||
+    (driveState == DriveState::LOCKED);
 
   if (hardCut) {
 
@@ -2496,6 +2579,13 @@ void loop() {
     driveEnableArmStart_ms = 0;
     digitalWrite(PIN_DRV_ENABLE, LOW);
   }
+
+  // ==================================================
+  // TELEMETRY (FULL LOOP CPU LOAD)
+  // ==================================================
+#if TELEMETRY_CSV
+  telemetryCSV(now, loopStart_us);
+#endif
 
   // ==================================================
   // HEARTBEAT
