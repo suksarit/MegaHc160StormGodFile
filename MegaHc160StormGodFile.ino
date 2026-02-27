@@ -639,21 +639,12 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   char wdD = wdDrive.faulted ? 'X' : 'O';
   char wdB = wdBlade.faulted ? 'X' : 'O';
 
-  // =====================================================
-  // ADS FLAGS
-  // =====================================================
   char adsCur = adsCurPresent ? '1' : '0';
   char adsVolt = adsVoltPresent ? '1' : '0';
 
-  // =====================================================
-  // GIMBAL STATE
-  // =====================================================
   char gimbalOn =
     (systemState == SystemState::ACTIVE && !faultLatched && !requireIbusConfirm) ? '1' : '0';
 
-  // =====================================================
-  // SAFETY RAW STATE
-  // =====================================================
   SafetyInput sin;
   memcpy(sin.curA, curA, sizeof(curA));
   sin.tempDriverL = tempDriverL;
@@ -671,44 +662,52 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
 
   // =====================================================
-  // DASHBOARD
+  // MULTI-LINE FORMAT (อ่านง่าย)
   // =====================================================
-  char line[260];
+  char line[400];
 
-  snprintf(line, sizeof(line),
-           "\r"
-           "TL:%3d TR:%3d | "
-           "V:%5.1f | "
-           "I:%6.1f | "
-           "PWM:%4d/%4d | "
-           "CPU:%6.1f%% M:%6.1f%% | "
-           "IB:%4lu | "
-           "WD:%c%c%c%c | "
-           "F:%2d | "
-           "RAM:%5d | "
-           "AR:%1d | "
-           "SR:%1d | "
-           "ADS:%c%c | "
-           "G:%c ",
-           tempDriverL,
-           tempDriverR,
-           engineVolt,
-           curMax,
-           curL,
-           curR,
-           cpuLoad,
-           loopMargin,
-           (unsigned long)(now - lastIbusByte_ms),
-           wdS, wdC, wdD, wdB,
-           (uint8_t)activeFault,
-           freeRam(),
-           autoReverseCount,
-           (uint8_t)rawSafety,
-           adsCur,
-           adsVolt,
-           gimbalOn);
+// แปลง float เป็น int เพื่อเลี่ยง %f
+int volt_x10      = (int)(engineVolt * 10.0f);
+int curMax_x10    = (int)(curMax * 10.0f);
+int cpuLoad_x10   = (int)(cpuLoad * 10.0f);
+int cpuMargin_x10 = (int)(loopMargin * 10.0f);
 
-  Serial.print(line);
+snprintf(line, sizeof(line),
+         "==============================\n"
+         "TEMP L/R   : %3d / %3d C\n"
+         "VOLT (24V) : %3d.%01d V\n"
+         "CURRENT MAX: %3d.%01d A\n"
+         "PWM L/R    : %4d / %4d\n"
+         "CPU LOAD   : %3d.%01d %%\n"
+         "CPU MARGIN : %3d.%01d %%\n"
+         "IBUS AGE   : %4lu ms\n"
+         "WATCHDOG   : S:%c C:%c D:%c B:%c\n"
+         "FAULT CODE : %2d\n"
+         "RAM FREE   : %5d B\n"
+         "AUTO REV   : %1d\n"
+         "SAFETY RAW : %1d\n"
+         "ADS CUR/V  : %c %c\n"
+         "GIMBAL ON  : %c\n"
+         "==============================",
+         tempDriverL,
+         tempDriverR,
+         volt_x10/10, abs(volt_x10%10),
+         curMax_x10/10, abs(curMax_x10%10),
+         curL,
+         curR,
+         cpuLoad_x10/10, abs(cpuLoad_x10%10),
+         cpuMargin_x10/10, abs(cpuMargin_x10%10),
+         (unsigned long)(now - lastIbusByte_ms),
+         wdS, wdC, wdD, wdB,
+         (uint8_t)activeFault,
+         freeRam(),
+         autoReverseCount,
+         (uint8_t)rawSafety,
+         adsCur,
+         adsVolt,
+         gimbalOn);
+
+Serial.println(line);
 
 #endif
 }
