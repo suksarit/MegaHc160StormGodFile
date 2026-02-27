@@ -573,19 +573,100 @@ void detectSideImbalanceAndSteer() {
 
 void detectWheelStuck(uint32_t now) {
 
-  if (abs(targetL) < 200 && abs(targetR) < 200) return;
+  // ==================================================
+  // CONFIG
+  // ==================================================
+  constexpr int16_t MIN_PWM_FOR_STUCK = 300;     // ต้องมีแรงขับจริง
+  constexpr int16_t TURNING_DIFF_MAX  = 250;     // เกินนี้ถือว่าเลี้ยว
+  constexpr uint32_t STUCK_TIME_MS    = 80;      // ต้องต่อเนื่อง >= 80ms
+
+  // ==================================================
+  // ต้องมีแรงขับจริง
+  // ==================================================
+  int16_t pwmMag = max(abs(curL), abs(curR));
+
+  if (pwmMag < MIN_PWM_FOR_STUCK)
+    return;
+
+  // ==================================================
+  // ห้ามอยู่ในช่วง turning
+  // ==================================================
+  if (abs(curL - curR) > TURNING_DIFF_MAX)
+    return;
 
   float cL = curLeft();
   float cR = curRight();
 
-  if (cL > CUR_LIMP_A && cR < CUR_WARN_A) {
-    lastDriveEvent = DriveEvent::STUCK_LEFT;
-    startAutoReverse(now);
+  float maxCur = max(cL, cR);
+
+  // โหลดต่ำไม่ถือว่า stuck
+  if (maxCur < CUR_WARN_A)
+    return;
+
+  // ==================================================
+  // ADAPTIVE PERCENT THRESHOLD
+  // ==================================================
+  float percentThreshold;
+
+  if (pwmMag < 400)
+    percentThreshold = 0.35f;   // ไวขึ้น
+  else if (pwmMag < 700)
+    percentThreshold = 0.45f;   // สมดุล
+  else
+    percentThreshold = 0.55f;   // เข้มขึ้นที่ความเร็วสูง
+
+  float diff = fabs(cL - cR);
+  float percentDiff = diff / maxCur;
+
+  static uint32_t leftStart_ms  = 0;
+  static uint32_t rightStart_ms = 0;
+
+  // ==================================================
+  // LEFT STUCK
+  // ==================================================
+  if (cL > cR &&
+      percentDiff > percentThreshold &&
+      cL > CUR_LIMP_A) {
+
+    if (leftStart_ms == 0)
+      leftStart_ms = now;
+
+    if (now - leftStart_ms >= STUCK_TIME_MS) {
+
+      leftStart_ms  = 0;
+      rightStart_ms = 0;
+
+      lastDriveEvent = DriveEvent::STUCK_LEFT;
+      startAutoReverse(now);
+      return;
+    }
+
+  } else {
+    leftStart_ms = 0;
   }
 
-  if (cR > CUR_LIMP_A && cL < CUR_WARN_A) {
-    lastDriveEvent = DriveEvent::STUCK_RIGHT;
-    startAutoReverse(now);
+  // ==================================================
+  // RIGHT STUCK
+  // ==================================================
+  if (cR > cL &&
+      percentDiff > percentThreshold &&
+      cR > CUR_LIMP_A) {
+
+    if (rightStart_ms == 0)
+      rightStart_ms = now;
+
+    if (now - rightStart_ms >= STUCK_TIME_MS) {
+
+      leftStart_ms  = 0;
+      rightStart_ms = 0;
+
+      lastDriveEvent = DriveEvent::STUCK_RIGHT;
+      startAutoReverse(now);
+      return;
+    }
+
+  } else {
+    rightStart_ms = 0;
   }
 }
 
