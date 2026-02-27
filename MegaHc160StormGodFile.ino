@@ -229,6 +229,9 @@ constexpr uint32_t AUTO_REV_RESET_WINDOW_MS = 5000;
 
 Adafruit_ADS1115 adsCur;
 Adafruit_ADS1115 adsVolt;
+bool adsCurPresent = false;
+bool adsVoltPresent = false;
+
 // ============================================================================
 // NON-BLOCKING CURRENT AUTO ZERO CALIBRATION
 // ============================================================================
@@ -974,6 +977,18 @@ void updateComms(uint32_t now) {
 // RUN ONLY IN SystemState::INIT
 // ============================================================================
 bool calibrateCurrentOffsetNonBlocking(uint32_t now) {
+
+  // --------------------------------------------------
+  // SENSOR PRESENCE GUARD (BENCH TEST ALLOW)
+  // --------------------------------------------------
+  if (!adsCurPresent) {
+#if DEBUG_SERIAL
+    Serial.println(F("[ACS] CAL SKIPPED - ADS NOT PRESENT"));
+#endif
+    currentOffsetCalibrated = true;  // ถือว่าคาลิเบรตแล้ว
+    return true;                     // ให้ระบบไป ACTIVE ได้
+  }
+
   if (currentOffsetCalibrated)
     return true;
 
@@ -1102,6 +1117,13 @@ void updateSensors() {
 
   uint32_t now = millis();
 
+  // --------------------------------------------------
+  // SENSOR PRESENCE GUARD
+  // --------------------------------------------------
+  if (!adsCurPresent && !adsVoltPresent) {
+    return;  // ไม่มี ADS เลย → ข้าม sensor logic
+  }
+
   // ==================================================
   // SENSOR TASK ALIVE (ANTI-FALSE WATCHDOG)
   // ==================================================
@@ -1153,13 +1175,35 @@ void updateSensors() {
       break;
 
     case I2CRecoverState::REINIT_ADS:
-      adsCur.begin(0x48);
-      adsCur.setGain(GAIN_ONE);
-      adsCur.setDataRate(RATE_ADS1115_860SPS);
+      // --------------------------------------------------
+      // ADS1115 DETECT (ROBUST INIT)
+      // --------------------------------------------------
 
-      adsVolt.begin(0x49);
-      adsVolt.setGain(GAIN_ONE);
-      adsVolt.setDataRate(RATE_ADS1115_860SPS);
+      adsCurPresent = adsCur.begin(0x48);
+      if (adsCurPresent) {
+        adsCur.setGain(GAIN_ONE);
+        adsCur.setDataRate(RATE_ADS1115_250SPS);
+#if DEBUG_SERIAL
+        Serial.println(F("[BOOT] ADS CUR OK (0x48)"));
+#endif
+      } else {
+#if DEBUG_SERIAL
+        Serial.println(F("[BOOT] ADS CUR NOT FOUND (0x48)"));
+#endif
+      }
+
+      adsVoltPresent = adsVolt.begin(0x49);
+      if (adsVoltPresent) {
+        adsVolt.setGain(GAIN_ONE);
+        adsVolt.setDataRate(RATE_ADS1115_250SPS);
+#if DEBUG_SERIAL
+        Serial.println(F("[BOOT] ADS VOLT OK (0x49)"));
+#endif
+      } else {
+#if DEBUG_SERIAL
+        Serial.println(F("[BOOT] ADS VOLT NOT FOUND (0x49)"));
+#endif
+      }
 
       i2cResetCount++;
       i2cState = I2CRecoverState::DONE;
@@ -1194,7 +1238,9 @@ void updateSensors() {
 
   constexpr uint16_t CUR_CONV_TIMEOUT_MS = 25;
 
-  if (!curConvRunning) {
+  if (!adsCurPresent) {
+    // ไม่มี ADS → ไม่อ่านกระแส
+  } else if (!curConvRunning) {
 
     uint16_t mux =
       ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[curIdx] << 12);
@@ -1255,7 +1301,9 @@ void updateSensors() {
 
   constexpr uint16_t VOLT_CONV_TIMEOUT_MS = 25;
 
-  if (!voltConvRunning) {
+  if (!adsVoltPresent) {
+    // ไม่มี ADS → ไม่อ่านแรงดัน
+  } else if (!voltConvRunning) {
     adsVolt.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
     voltConvRunning = true;
     voltConvStart_ms = now;
@@ -1297,6 +1345,8 @@ void updateSensors() {
   // ==================================================
   // ----------- TEMPERATURE --------------------------
   // ==================================================
+#if !TEST_MODE
+
   static uint32_t lastTemp_ms = 0;
   static uint32_t lastTempOk_ms = 0;
 
@@ -1305,6 +1355,7 @@ void updateSensors() {
     lastTemp_ms = now;
 
     int16_t tL, tR;
+
     if (!readDriverTempsPT100(tL, tR)) {
       latchFault(FaultCode::TEMP_SENSOR_FAULT);
       return;
@@ -1327,7 +1378,9 @@ void updateSensors() {
     latchFault(FaultCode::TEMP_SENSOR_FAULT);
     return;
   }
-}
+
+#endif
+ }
 
 void runDrive(uint32_t now) {
 
@@ -2077,12 +2130,36 @@ void setup() {
   Wire.setClock(100000);
   Wire.setWireTimeout(6000, true);
 
-  adsCur.begin(0x48);  // ADS1115 กระแส
-  adsCur.setGain(GAIN_ONE);
-  adsCur.setDataRate(RATE_ADS1115_860SPS);
-  adsVolt.begin(0x49);  // ADS1115 แรงดัน
-  adsVolt.setGain(GAIN_ONE);
-  adsVolt.setDataRate(RATE_ADS1115_860SPS);
+  // --------------------------------------------------
+  // ADS1115 DETECT (ROBUST INIT)
+  // --------------------------------------------------
+
+  adsCurPresent = adsCur.begin(0x48);
+  if (adsCurPresent) {
+    adsCur.setGain(GAIN_ONE);
+    adsCur.setDataRate(RATE_ADS1115_250SPS);
+#if DEBUG_SERIAL
+    Serial.println(F("[BOOT] ADS CUR OK (0x48)"));
+#endif
+  } else {
+#if DEBUG_SERIAL
+    Serial.println(F("[BOOT] ADS CUR NOT FOUND (0x48)"));
+#endif
+  }
+
+  adsVoltPresent = adsVolt.begin(0x49);
+  if (adsVoltPresent) {
+    adsVolt.setGain(GAIN_ONE);
+    adsVolt.setDataRate(RATE_ADS1115_250SPS);
+#if DEBUG_SERIAL
+    Serial.println(F("[BOOT] ADS VOLT OK (0x49)"));
+#endif
+  } else {
+#if DEBUG_SERIAL
+    Serial.println(F("[BOOT] ADS VOLT NOT FOUND (0x49)"));
+#endif
+  }
+
   // --------------------------------------------------
   // READ LAST FAULT FROM EEPROM (FAULT HISTORY)
   // --------------------------------------------------
@@ -2146,9 +2223,16 @@ void setup() {
   // --------------------------------------------------
   // SPI / TEMPERATURE
   // --------------------------------------------------
+  // SPI / TEMPERATURE
+#if !TEST_MODE
   SPI.begin();
   maxL.begin(MAX31865_3WIRE);
   maxR.begin(MAX31865_3WIRE);
+#else
+#if DEBUG_SERIAL
+  Serial.println(F("[BOOT] TEST MODE - PT100 DISABLED"));
+#endif
+#endif
 
   // --------------------------------------------------
   // PWM / SERVO
@@ -2418,4 +2502,3 @@ void loop() {
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
 }
-
