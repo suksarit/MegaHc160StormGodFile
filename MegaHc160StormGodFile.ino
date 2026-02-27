@@ -206,6 +206,12 @@ int16_t targetR = 0;
 int16_t curL = 0;
 int16_t curR = 0;
 
+// ==================================================
+// IMBALANCE CORRECTION LAYER (NO TARGET DRIFT)
+// ==================================================
+int16_t imbalanceCorrL = 0;
+int16_t imbalanceCorrR = 0;
+
 uint32_t driveSoftStopStart_ms = 0;
 uint32_t bladeSoftStopStart_ms = 0;
 
@@ -353,7 +359,7 @@ constexpr uint8_t VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอ
 // FREE RAM (SRAM MONITOR)
 // ======================================================
 extern unsigned int __heap_start;
-extern void* __brkval;
+extern void *__brkval;
 
 int freeRam() {
   int v;
@@ -509,8 +515,24 @@ void forceDriveSoftStop(uint32_t now) {
 
 void detectSideImbalanceAndSteer() {
 
-  if (abs(targetL) < 200 && abs(targetR) < 200) return;
-  if (abs(targetL - targetR) > 200) return;  // กำลังเลี้ยวอยู่
+  // ==================================================
+  // RESET CORRECTION EVERY LOOP (TRANSIENT LAYER)
+  // ==================================================
+  imbalanceCorrL = 0;
+  imbalanceCorrR = 0;
+
+  // ==================================================
+  // DO NOT APPLY WHEN VEHICLE ACTUALLY NOT MOVING
+  // ใช้ curL/curR แทน target เพื่อสัมพันธ์แรงจริง
+  // ==================================================
+  if (abs(curL) < 200 && abs(curR) < 200)
+    return;
+
+  // ==================================================
+  // SKIP WHEN INTENTIONALLY TURNING
+  // ==================================================
+  if (abs(targetL - targetR) > 200)
+    return;
 
   float cL = curLeft();
   float cR = curRight();
@@ -518,19 +540,34 @@ void detectSideImbalanceAndSteer() {
   constexpr float CUR_IMBALANCE_A = 25.0f;
   constexpr int16_t STEER_COMP = 140;
 
-  if (abs(cL - cR) < CUR_IMBALANCE_A) return;
+  // ==================================================
+  // DEBOUNCE (ANTI GRASS SPIKE)
+  // ต้อง imbalance ต่อเนื่อง 2 รอบขึ้นไป
+  // ==================================================
+  static uint8_t imbCnt = 0;
 
+  if (abs(cL - cR) > CUR_IMBALANCE_A) {
+    if (++imbCnt < 2)
+      return;  // ยังไม่พอ
+  } else {
+    imbCnt = 0;
+    return;
+  }
+
+  // ==================================================
+  // APPLY CORRECTION
+  // ==================================================
   lastDriveEvent = DriveEvent::IMBALANCE;
 
-  // ซ้ายหนัก → เบี่ยงขวานิด
+  // ซ้ายหนัก → เบี่ยงขวา
   if (cL > cR) {
-    targetL -= STEER_COMP;
-    targetR += STEER_COMP;
+    imbalanceCorrL = -STEER_COMP;
+    imbalanceCorrR = +STEER_COMP;
   }
-  // ขวาหนัก → เบี่ยงซ้ายนิด
+  // ขวาหนัก → เบี่ยงซ้าย
   else {
-    targetL += STEER_COMP;
-    targetR -= STEER_COMP;
+    imbalanceCorrL = +STEER_COMP;
+    imbalanceCorrR = -STEER_COMP;
   }
 }
 
@@ -598,9 +635,9 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   // WATCHDOG STATUS
   // =====================================================
   char wdS = wdSensor.faulted ? 'X' : 'O';
-  char wdC = wdComms.faulted  ? 'X' : 'O';
-  char wdD = wdDrive.faulted  ? 'X' : 'O';
-  char wdB = wdBlade.faulted  ? 'X' : 'O';
+  char wdC = wdComms.faulted ? 'X' : 'O';
+  char wdD = wdDrive.faulted ? 'X' : 'O';
+  char wdB = wdBlade.faulted ? 'X' : 'O';
 
   // =====================================================
   // ADS FLAGS
@@ -612,9 +649,7 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   // GIMBAL STATE
   // =====================================================
   char gimbalOn =
-    (systemState == SystemState::ACTIVE &&
-     !faultLatched &&
-     !requireIbusConfirm) ? '1' : '0';
+    (systemState == SystemState::ACTIVE && !faultLatched && !requireIbusConfirm) ? '1' : '0';
 
   // =====================================================
   // SAFETY RAW STATE
@@ -1645,16 +1680,15 @@ void monitorSubsystemWatchdogs(uint32_t now) {
   }
 }
 
-// ============================================================================
-// APPLY DRIVE OUTPUT (FIXED / FIELD-SAFE / AUTO-REVERSE AWARE)
-// ============================================================================
 void applyDrive() {
+
   uint32_t now = millis();
 
   // ==================================================
   // HARD STOP : SYSTEM FAULT
   // ==================================================
   if (systemState == SystemState::FAULT || driveState == DriveState::LOCKED) {
+
     driveSafe();
     curL = 0;
     curR = 0;
@@ -1666,47 +1700,38 @@ void applyDrive() {
   }
 
   // ==================================================
-  // AUTO REVERSE OVERRIDE (DIRECTION-AWARE)
+  // AUTO REVERSE OVERRIDE
   // ==================================================
   if (autoReverseActive) {
 
     if (now - autoReverseStart_ms < AUTO_REV_MS) {
 
-      // -----------------------------------------------
-      // Determine reverse direction per wheel
-      // Reverse opposite of current movement
-      // -----------------------------------------------
+      int16_t refL = (targetL != 0) ? targetL : curL;
+      int16_t refR = (targetR != 0) ? targetR : curR;
 
-      int8_t dirL = (curL > 0) ? -1 : (curL < 0 ? 1 : 0);
-      int8_t dirR = (curR > 0) ? -1 : (curR < 0 ? 1 : 0);
+      int8_t dirL = (refL > 0) ? -1 : (refL < 0 ? 1 : -1);
+      int8_t dirR = (refR > 0) ? -1 : (refR < 0 ? 1 : -1);
 
-      // ถ้าล้อใดหยุดนิ่ง ให้ถือว่า reverse ตรง
-      if (dirL == 0) dirL = -1;
-      if (dirR == 0) dirR = -1;
-
-      // LEFT
       digitalWrite(DIR_L1, dirL > 0);
       digitalWrite(DIR_L2, dirL < 0);
-
-      // RIGHT
       digitalWrite(DIR_R1, dirR > 0);
       digitalWrite(DIR_R2, dirR < 0);
 
       setPWM_L(AUTO_REV_PWM);
       setPWM_R(AUTO_REV_PWM);
 
-      return;  // override normal drive
-    } else {
-
+      return;
+    }
+    else {
       autoReverseActive = false;
-
 #if DEBUG_SERIAL
       Serial.println(F("[AUTO REV] END"));
 #endif
     }
   }
+
   // ==================================================
-  // SAFETY EMERGENCY (NO DRIVE)
+  // SAFETY EMERGENCY
   // ==================================================
   if (getDriveSafety() == SafetyState::EMERGENCY) {
     targetL = 0;
@@ -1714,58 +1739,66 @@ void applyDrive() {
   }
 
   // ==================================================
-  // DIRECTION CHANGE DEAD-TIME
+  // APPLY IMBALANCE CORRECTION (DECLARE FIRST!)
   // ==================================================
-  bool wantRevL = (curL > 0 && targetL < 0) || (curL < 0 && targetL > 0);
-  bool wantRevR = (curR > 0 && targetR < 0) || (curR < 0 && targetR > 0);
+  int16_t finalTargetL = targetL + imbalanceCorrL;
+  int16_t finalTargetR = targetR + imbalanceCorrR;
 
-  if (wantRevL && revBlockUntilL == 0) {
+  finalTargetL = constrain(finalTargetL, -PWM_TOP, PWM_TOP);
+  finalTargetR = constrain(finalTargetR, -PWM_TOP, PWM_TOP);
+
+  // ==================================================
+  // DIRECTION CHANGE DEAD-TIME (USE FINAL TARGET)
+  // ==================================================
+  bool wantRevL =
+    (curL > 0 && finalTargetL < 0) ||
+    (curL < 0 && finalTargetL > 0);
+
+  bool wantRevR =
+    (curR > 0 && finalTargetR < 0) ||
+    (curR < 0 && finalTargetR > 0);
+
+  if (wantRevL && revBlockUntilL == 0)
     revBlockUntilL = now + REVERSE_DEADTIME_MS;
-  }
-  if (wantRevR && revBlockUntilR == 0) {
+
+  if (wantRevR && revBlockUntilR == 0)
     revBlockUntilR = now + REVERSE_DEADTIME_MS;
-  }
 
-  if (revBlockUntilL && now < revBlockUntilL) {
-    targetL = 0;
-  } else if (revBlockUntilL && now >= revBlockUntilL) {
+  if (revBlockUntilL && now < revBlockUntilL)
+    finalTargetL = 0;
+  else if (revBlockUntilL && now >= revBlockUntilL)
     revBlockUntilL = 0;
-  }
 
-  if (revBlockUntilR && now < revBlockUntilR) {
-    targetR = 0;
-  } else if (revBlockUntilR && now >= revBlockUntilR) {
+  if (revBlockUntilR && now < revBlockUntilR)
+    finalTargetR = 0;
+  else if (revBlockUntilR && now >= revBlockUntilR)
     revBlockUntilR = 0;
-  }
 
   // ==================================================
   // RAMP RATE CONTROL
   // ==================================================
   int16_t step;
-  if (targetL == 0 && targetR == 0) {
-    step = 2;
-  } else if (driveState == DriveState::SOFT_STOP) {
-    step = 2;
-  } else if (driveState == DriveState::LIMP) {
-    step = 4;
-  } else {
-    step = 5;
-  }
 
-  curL = ramp(curL, targetL, step);
-  curR = ramp(curR, targetR, step);
+  if (finalTargetL == 0 && finalTargetR == 0)
+    step = 2;
+  else if (driveState == DriveState::SOFT_STOP)
+    step = 2;
+  else if (driveState == DriveState::LIMP)
+    step = 4;
+  else
+    step = 5;
+
+  curL = ramp(curL, finalTargetL, step);
+  curR = ramp(curR, finalTargetR, step);
 
   // ==================================================
-  // OUTPUT DIRECTION
+  // OUTPUT
   // ==================================================
   digitalWrite(DIR_L1, curL > 0);
   digitalWrite(DIR_L2, curL < 0);
   digitalWrite(DIR_R1, curR > 0);
   digitalWrite(DIR_R2, curR < 0);
 
-  // ==================================================
-  // OUTPUT PWM
-  // ==================================================
   setPWM_L(abs(curL));
   setPWM_R(abs(curR));
 }
@@ -2470,8 +2503,7 @@ void loop() {
   processFaultReset(now);
 
   bool emergencyActive =
-    (systemState == SystemState::FAULT) ||
-    (getDriveSafety() == SafetyState::EMERGENCY);
+    (systemState == SystemState::FAULT) || (getDriveSafety() == SafetyState::EMERGENCY);
 
   // ==================================================
   // SYSTEM GATE (EMERGENCY BOUNDARY)
@@ -2489,7 +2521,7 @@ void loop() {
     }
 
 #if TELEMETRY_CSV
-    telemetryCSV(now, loopStart_us);   // << ย้ายมาไว้ก่อน return
+    telemetryCSV(now, loopStart_us);  // << ย้ายมาไว้ก่อน return
 #endif
 
     digitalWrite(PIN_HW_WD_HB,
@@ -2526,9 +2558,7 @@ void loop() {
   updateStarter(now);
 
   gimbal.setSystemEnabled(
-    systemState == SystemState::ACTIVE &&
-    !emergencyActive &&
-    !requireIbusConfirm);
+    systemState == SystemState::ACTIVE && !emergencyActive && !requireIbusConfirm);
 
   gimbal.update(now);
 
@@ -2551,13 +2581,10 @@ void loop() {
   static uint32_t driveEnableArmStart_ms = 0;
 
   bool runAllowed =
-    (driveState == DriveState::RUN ||
-     driveState == DriveState::LIMP);
+    (driveState == DriveState::RUN || driveState == DriveState::LIMP);
 
   bool hardCut =
-    emergencyActive ||
-    (driveState == DriveState::SOFT_STOP) ||
-    (driveState == DriveState::LOCKED);
+    emergencyActive || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
 
   if (hardCut) {
 
@@ -2593,3 +2620,4 @@ void loop() {
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
 }
+
