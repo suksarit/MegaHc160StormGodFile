@@ -1234,23 +1234,25 @@ void updateSensors() {
 
   uint32_t now = millis();
 
-  // --------------------------------------------------
+  // ==================================================
   // SENSOR PRESENCE GUARD
-  // --------------------------------------------------
+  // ==================================================
   if (!adsCurPresent && !adsVoltPresent) {
-    return;  // ไม่มี ADS เลย → ข้าม sensor logic
+    return;  // ไม่มี ADS เลย → ไม่ feed watchdog
   }
 
   // ==================================================
-  // SENSOR TASK ALIVE (ANTI-FALSE WATCHDOG)
+  // SENSOR HEALTH FLAG (CRITICAL FIX)
   // ==================================================
-  wdSensor.lastUpdate_ms = now;
+  bool sensorHealthyThisCycle = false;
 
 #if TEST_MODE
   curA[0] = curA[1] = curA[2] = curA[3] = 5.0f;
   tempDriverL = 45;
   tempDriverR = 47;
   engineVolt = 26.0f;
+
+  wdSensor.lastUpdate_ms = now;  // TEST MODE อนุญาต
   return;
 #endif
 
@@ -1279,8 +1281,7 @@ void updateSensors() {
 
     case I2CRecoverState::END_BUS:
       Wire.end();
-      i2cState = I2CRecoverState::BEGIN_BUS;
-      break;
+      return;  // ❗ recovery phase → ไม่ feed
 
     case I2CRecoverState::BEGIN_BUS:
       if (now - i2cStateStart_ms >= 1) {
@@ -1289,50 +1290,32 @@ void updateSensors() {
         Wire.setWireTimeout(6000, true);
         i2cState = I2CRecoverState::REINIT_ADS;
       }
-      break;
+      return;
 
     case I2CRecoverState::REINIT_ADS:
-      // --------------------------------------------------
-      // ADS1115 DETECT (ROBUST INIT)
-      // --------------------------------------------------
 
       adsCurPresent = adsCur.begin(0x48);
       if (adsCurPresent) {
         adsCur.setGain(GAIN_ONE);
         adsCur.setDataRate(RATE_ADS1115_250SPS);
-#if DEBUG_SERIAL
-        Serial.println(F("[BOOT] ADS CUR OK (0x48)"));
-#endif
-      } else {
-#if DEBUG_SERIAL
-        Serial.println(F("[BOOT] ADS CUR NOT FOUND (0x48)"));
-#endif
       }
 
       adsVoltPresent = adsVolt.begin(0x49);
       if (adsVoltPresent) {
         adsVolt.setGain(GAIN_ONE);
         adsVolt.setDataRate(RATE_ADS1115_250SPS);
-#if DEBUG_SERIAL
-        Serial.println(F("[BOOT] ADS VOLT OK (0x49)"));
-#endif
-      } else {
-#if DEBUG_SERIAL
-        Serial.println(F("[BOOT] ADS VOLT NOT FOUND (0x49)"));
-#endif
       }
 
       i2cResetCount++;
       i2cState = I2CRecoverState::DONE;
-      break;
+      return;
 
     case I2CRecoverState::DONE:
       if (i2cResetCount >= 3) {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
-        return;
       }
       i2cState = I2CRecoverState::IDLE;
-      break;
+      return;
 
     default:
       break;
@@ -1347,7 +1330,7 @@ void updateSensors() {
   }
 
   // ==================================================
-  // ----------- ASYNC CURRENT (WITH STALL GUARD) -----
+  // ----------- ASYNC CURRENT ------------------------
   // ==================================================
   static uint8_t curIdx = 0;
   static bool curConvRunning = false;
@@ -1355,61 +1338,63 @@ void updateSensors() {
 
   constexpr uint16_t CUR_CONV_TIMEOUT_MS = 25;
 
-  if (!adsCurPresent) {
-    // ไม่มี ADS → ไม่อ่านกระแส
-  } else if (!curConvRunning) {
+  if (adsCurPresent) {
 
-    uint16_t mux =
-      ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[curIdx] << 12);
+    if (!curConvRunning) {
 
-    adsCur.startADCReading(mux, false);
-    curConvRunning = true;
-    curConvStart_ms = now;
+      uint16_t mux =
+        ADS1X15_REG_CONFIG_MUX_SINGLE_0 +
+        (ADS_CUR_CH_MAP[curIdx] << 12);
 
-  } else {
+      adsCur.startADCReading(mux, false);
+      curConvRunning = true;
+      curConvStart_ms = now;
 
-    if (adsCur.conversionComplete()) {
+    } else {
 
-      int16_t raw = adsCur.getLastConversionResults();
-      float v = raw * ADS1115_LSB_V;
-      float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
+      if (adsCur.conversionComplete()) {
 
-      if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE) {
-        latchFault(FaultCode::CUR_SENSOR_FAULT);
-        return;
-      }
+        int16_t raw = adsCur.getLastConversionResults();
+        float v = raw * ADS1115_LSB_V;
+        float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
 
-      curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
-
-      if (a > CUR_SPIKE_A) {
-        forceDriveSoftStop(now);
-        bladeState = BladeState::SOFT_STOP;
-      }
-
-      if (a > CUR_TRIP_A_CH[curIdx]) {
-        if (++overCurCnt[curIdx] >= 2) {
-          latchFault(FaultCode::OVER_CURRENT);
+        if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE) {
+          latchFault(FaultCode::CUR_SENSOR_FAULT);
           return;
         }
-      } else {
-        overCurCnt[curIdx] = 0;
+
+        curA[curIdx] += CUR_LPF_ALPHA *
+                        (a - curA[curIdx]);
+
+        sensorHealthyThisCycle = true;   // ✔ current OK
+
+        if (a > CUR_SPIKE_A) {
+          forceDriveSoftStop(now);
+          bladeState = BladeState::SOFT_STOP;
+        }
+
+        if (a > CUR_TRIP_A_CH[curIdx]) {
+          if (++overCurCnt[curIdx] >= 2) {
+            latchFault(FaultCode::OVER_CURRENT);
+            return;
+          }
+        } else {
+          overCurCnt[curIdx] = 0;
+        }
+
+        curIdx++;
+        if (curIdx >= 4) curIdx = 0;
+
+        curConvRunning = false;
+
+      } else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
+        curConvRunning = false;
       }
-
-      curIdx++;
-      if (curIdx >= 4) curIdx = 0;
-
-      curConvRunning = false;
-    } else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
-
-#if DEBUG_SERIAL
-      Serial.println(F("[ADS] CURRENT CONVERSION TIMEOUT"));
-#endif
-      curConvRunning = false;
     }
   }
 
   // ==================================================
-  // ----------- ASYNC VOLTAGE (WITH STALL GUARD) -----
+  // ----------- ASYNC VOLTAGE ------------------------
   // ==================================================
   static bool voltConvRunning = false;
   static uint32_t voltConvStart_ms = 0;
@@ -1418,36 +1403,46 @@ void updateSensors() {
 
   constexpr uint16_t VOLT_CONV_TIMEOUT_MS = 25;
 
-  if (!adsVoltPresent) {
-    // ไม่มี ADS → ไม่อ่านแรงดัน
-  } else if (!voltConvRunning) {
-    adsVolt.startADCReading(ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
-    voltConvRunning = true;
-    voltConvStart_ms = now;
-  } else {
+  if (adsVoltPresent) {
 
-    if (adsVolt.conversionComplete()) {
+    if (!voltConvRunning) {
 
-      int16_t raw = adsVolt.getLastConversionResults();
-      float v_adc = raw * ADS1115_LSB_V;
-      float vRaw = v_adc * ((150.0f + 33.0f) / 33.0f);
+      adsVolt.startADCReading(
+        ADS1X15_REG_CONFIG_MUX_SINGLE_0, false);
 
-      if (vRaw > 0.0f && vRaw < 40.0f) {
-        engineVolt += 0.15f * (vRaw - engineVolt);
-        lastVoltOk_ms = now;
+      voltConvRunning = true;
+      voltConvStart_ms = now;
+
+    } else {
+
+      if (adsVolt.conversionComplete()) {
+
+        int16_t raw =
+          adsVolt.getLastConversionResults();
+
+        float v_adc = raw * ADS1115_LSB_V;
+        float vRaw =
+          v_adc * ((150.0f + 33.0f) / 33.0f);
+
+        if (vRaw > 0.0f && vRaw < 40.0f) {
+
+          engineVolt += 0.15f *
+            (vRaw - engineVolt);
+
+          lastVoltOk_ms = now;
+          sensorHealthyThisCycle = true;   // ✔ voltage OK
+        }
+
+        voltConvRunning = false;
+
+      } else if (now - voltConvStart_ms >
+                 VOLT_CONV_TIMEOUT_MS) {
+
+        voltConvRunning = false;
       }
-
-      voltConvRunning = false;
-    } else if (now - voltConvStart_ms > VOLT_CONV_TIMEOUT_MS) {
-
-#if DEBUG_SERIAL
-      Serial.println(F("[ADS] VOLT CONVERSION TIMEOUT"));
-#endif
-      voltConvRunning = false;
     }
   }
 
-  // -------- Voltage timeout logic --------
   if (now - lastVoltOk_ms > VOLT_SENSOR_TIMEOUT_MS) {
 
     if (++voltFailCnt >= VOLT_SENSOR_FAIL_COUNT) {
@@ -1482,21 +1477,31 @@ void updateSensors() {
     tempDriverR = tR;
     lastTempOk_ms = now;
 
-    if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C) {
+    sensorHealthyThisCycle = true;   // ✔ temp OK
+
+    if (tL > TEMP_TRIP_C ||
+        tR > TEMP_TRIP_C) {
+
       latchFault(FaultCode::OVER_TEMP);
       return;
     }
   }
 
-  if (now - lastTempOk_ms > TEMP_SENSOR_TIMEOUT_MS) {
-#if DEBUG_SERIAL
-    Serial.println(F("[TEMP] SENSOR TIMEOUT"));
-#endif
+  if (now - lastTempOk_ms >
+      TEMP_SENSOR_TIMEOUT_MS) {
+
     latchFault(FaultCode::TEMP_SENSOR_FAULT);
     return;
   }
 
 #endif
+
+  // ==================================================
+  // FEED SENSOR WATCHDOG ONLY IF SENSOR REALLY WORKED
+  // ==================================================
+  if (sensorHealthyThisCycle && !faultLatched) {
+    wdSensor.lastUpdate_ms = now;
+  }
 }
 
 void runDrive(uint32_t now) {
@@ -2620,4 +2625,5 @@ void loop() {
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
 }
+
 

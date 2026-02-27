@@ -1,5 +1,5 @@
 // ========================================================================================
-// SafetyManager.h  (TESTABLE / FIELD-SAFE / NO GLOBAL STATE)
+// SafetyManager.h  (PURE RAW + STABILITY LAYER SEPARATED)
 // ========================================================================================
 
 #ifndef SAFETY_MANAGER_H
@@ -9,7 +9,7 @@
 #include "SystemTypes.h"  // SafetyState, DriveEvent
 
 // ============================================================================
-// SAFETY INPUT SNAPSHOT (PURE DATA, NO GLOBAL DEPENDENCY)
+// SAFETY INPUT SNAPSHOT (PURE DATA)
 // ============================================================================
 struct SafetyInput {
   float curA[4];        // กระแสแต่ละช่อง
@@ -20,7 +20,7 @@ struct SafetyInput {
 };
 
 // ============================================================================
-// SAFETY THRESHOLDS (INJECTABLE → UNIT TESTABLE)
+// SAFETY THRESHOLDS (INJECTABLE)
 // ============================================================================
 struct SafetyThresholds {
   int16_t CUR_WARN_A;
@@ -30,24 +30,15 @@ struct SafetyThresholds {
 };
 
 // ============================================================================
-// PUBLIC API
+// PURE RAW LOGIC (NO STATE / NO STATIC / NO SIDE EFFECT)
 // ============================================================================
-
-// --------------------------------------------------------------------------
-// PURE LOGIC
-// ไม่มี side-effect
-// ไม่มี global access
-// ใช้สำหรับ unit test ได้โดยตรง
-// --------------------------------------------------------------------------
 SafetyState evaluateSafetyRaw(
   const SafetyInput& in,
   const SafetyThresholds& th);
 
-// --------------------------------------------------------------------------
-// STATE MACHINE
-// จัดการ hysteresis + stability timing
-// ไม่มี global extern อีกต่อไป
-// --------------------------------------------------------------------------
+// ============================================================================
+// STABILITY + HYSTERESIS LAYER
+// ============================================================================
 void updateSafetyStability(
   SafetyState raw,
   uint32_t now,
@@ -55,16 +46,11 @@ void updateSafetyStability(
   bool& autoReverseActive,
   DriveEvent& lastDriveEvent);
 
-// --------------------------------------------------------------------------
-// SAFETY STATE ACCESS (ENCAPSULATED)
-// --------------------------------------------------------------------------
-
-// อ่านค่า safety ปัจจุบัน (read-only access)
+// ============================================================================
+// ACCESSORS
+// ============================================================================
 SafetyState getDriveSafety();
-
-// ใช้เฉพาะกรณี system-level reset เช่น ignition fault reset
 void forceSafetyState(SafetyState s);
 
-#endif  // SAFETY_MANAGER_H
-
+#endif
 
