@@ -482,13 +482,23 @@ inline float curRight() {
 void startAutoReverse(uint32_t now) {
 
   // --------------------------------------------------
+  // AUTO REVERSE WINDOW RESET
+  // --------------------------------------------------
+  static uint32_t autoRevWindowStart_ms = 0;
+
+  if (autoRevWindowStart_ms == 0)
+    autoRevWindowStart_ms = now;
+
+  if (now - autoRevWindowStart_ms > AUTO_REV_RESET_WINDOW_MS) {
+    autoReverseCount = 0;
+    autoRevWindowStart_ms = now;
+  }
+
+  // --------------------------------------------------
   // HARD GUARD
   // --------------------------------------------------
-  if (autoReverseActive) return;                                                // กำลัง reverse อยู่
-  if (autoReverseCount >= MAX_AUTO_REVERSE) return;                             // เกินโควตา
-  if (driveState != DriveState::RUN && driveState != DriveState::LIMP) return;  // ต้องอยู่ใน state ที่ขับจริง
-  if (getDriveSafety() == SafetyState::EMERGENCY) return;
-  if (systemState != SystemState::ACTIVE) return;
+  if (autoReverseActive) return;
+  if (autoReverseCount >= MAX_AUTO_REVERSE) return;
 
   // --------------------------------------------------
   // COOLDOWN (CRITICAL FOR FIELD)
@@ -690,27 +700,86 @@ void detectWheelLock() {
   static uint8_t lockCnt = 0;
 
   // ==================================================
-  // ต้องมีแรงขับจริงจาก PWM output (ไม่ใช่ target)
+  // CONFIG
   // ==================================================
-  constexpr int16_t MIN_PWM_FOR_LOCK = 250;
+  constexpr int16_t MIN_PWM_FOR_LOCK = 350;
+  constexpr float CURRENT_BALANCE_RATIO = 0.25f;
+  constexpr uint8_t LOCK_CONFIRM_CNT = 4;
 
-  if (abs(curL) < MIN_PWM_FOR_LOCK && abs(curR) < MIN_PWM_FOR_LOCK) {
+  // ==================================================
+  // ต้องมีแรงขับจริง
+  // ==================================================
+  int16_t pwmMag = max(abs(curL), abs(curR));
 
+  if (pwmMag < MIN_PWM_FOR_LOCK) {
     lockCnt = 0;
     return;
   }
 
   // ==================================================
-  // BOTH SIDES HIGH CURRENT → POSSIBLE LOCK
+  // CURRENT
   // ==================================================
-  if (curLeft() > CUR_LIMP_A && curRight() > CUR_LIMP_A) {
+  float cL = curLeft();
+  float cR = curRight();
 
-    if (++lockCnt >= 3) {
+  float maxCur = max(cL, cR);
+  float diffCur = fabs(cL - cR);
 
-      lastDriveEvent = DriveEvent::WHEEL_LOCK;
-      latchFault(FaultCode::OVER_CURRENT);
+  // ==================================================
+  // CURRENT BALANCE
+  // ถ้าต่างกันมาก = หญ้าหนา ไม่ใช่ lock
+  // ==================================================
+  if (maxCur <= 0.1f) {
+    lockCnt = 0;
+    return;
+  }
+
+  float balanceRatio = diffCur / maxCur;
+
+  if (balanceRatio > CURRENT_BALANCE_RATIO) {
+    lockCnt = 0;
+    return;
+  }
+
+  // ==================================================
+  // ADAPTIVE CURRENT THRESHOLD
+  // ==================================================
+  float lockCurrentThreshold;
+
+  if (pwmMag < 500)
+    lockCurrentThreshold = CUR_LIMP_A * 0.85f;
+  else if (pwmMag < 800)
+    lockCurrentThreshold = CUR_LIMP_A;
+  else
+    lockCurrentThreshold = CUR_LIMP_A * 1.15f;
+
+  // ==================================================
+  // BOTH SIDES HIGH CURRENT
+  // ==================================================
+  if (cL > lockCurrentThreshold && cR > lockCurrentThreshold) {
+
+    // ==================================================
+    // RAMP SATURATION CHECK
+    // motor output ใกล้ target แล้ว
+    // ==================================================
+    int16_t errL = abs(targetL - curL);
+    int16_t errR = abs(targetR - curR);
+
+    if (errL < 50 && errR < 50) {
+
+      if (++lockCnt >= LOCK_CONFIRM_CNT) {
+
+        lastDriveEvent = DriveEvent::WHEEL_LOCK;
+        latchFault(FaultCode::OVER_CURRENT);
+      }
+
+    } else {
+
+      lockCnt = 0;
     }
+
   } else {
+
     lockCnt = 0;
   }
 }
@@ -848,8 +917,27 @@ void updateDriveTarget() {
     return (int16_t)constrain(m, 0, OUT_MAX);
   };
 
-  int16_t thr = mapAxis(ibus.readChannel(CH_THROTTLE));
-  int16_t str = mapAxis(ibus.readChannel(CH_STEER));
+  // ==================================================
+  // IBUS SPIKE FILTER
+  // ==================================================
+  static uint16_t lastThr = 1500;
+  static uint16_t lastStr = 1500;
+
+  uint16_t rawThr = ibus.readChannel(CH_THROTTLE);
+  uint16_t rawStr = ibus.readChannel(CH_STEER);
+
+  // reject spike >300us
+  if (abs((int)rawThr - (int)lastThr) > 300)
+    rawThr = lastThr;
+
+  if (abs((int)rawStr - (int)lastStr) > 300)
+    rawStr = lastStr;
+
+  lastThr = rawThr;
+  lastStr = rawStr;
+
+  int16_t thr = mapAxis(rawThr);
+  int16_t str = mapAxis(rawStr);
 
   float absThr = abs(thr);
   float blend;
@@ -1138,6 +1226,12 @@ void backgroundFaultEEPROMTask(uint32_t now) {
 }
 
 void updateComms(uint32_t now) {
+
+  // ==================================================
+  // IBUS LOST COUNTER (DECLARE FIRST)
+  // ==================================================
+  static uint8_t ibusLostCnt = 0;
+
   // ==================================================
   // IBUS BYTE PARSING
   // ==================================================
@@ -1153,25 +1247,28 @@ void updateComms(uint32_t now) {
   // RECOVERY: BYTE RETURNS
   // ==================================================
   if (gotByte) {
+
     if (ibusCommLost) {
+
 #if DEBUG_SERIAL
       Serial.println(F("[IBUS] RECOVERED"));
 #endif
-      // reset confirmation requirement
+
       requireIbusConfirm = false;
     }
 
+    // reset lost counter
+    ibusLostCnt = 0;
+
     ibusCommLost = false;
 
-    // ✔ Dual-layer freshness update
+    // refresh watchdog
     wdComms.lastUpdate_ms = now;
   }
 
   // ==================================================
-  // SOFT TIMEOUT (COMM LOST → EMERGENCY)
+  // SOFT TIMEOUT (COMM LOST)
   // ==================================================
-  static uint8_t ibusLostCnt = 0;
-
   if (now - lastIbusByte_ms > 100) {
 
     if (++ibusLostCnt >= 3) {
@@ -1196,16 +1293,17 @@ void updateComms(uint32_t now) {
   // HARD TIMEOUT (FAULT)
   // ==================================================
   if (now - lastIbusByte_ms > IBUS_TIMEOUT_MS) {
+
 #if DEBUG_SERIAL
     Serial.println(F("[IBUS] HARD LOST -> FAULT"));
 #endif
+
     latchFault(FaultCode::IBUS_LOST);
     return;
   }
 
   // ==================================================
   // COMMS HEALTHY → update freshness
-  // (กรณีไม่มี byte ใหม่ แต่ยังไม่ timeout)
   // ==================================================
   if (!ibusCommLost) {
     wdComms.lastUpdate_ms = now;
@@ -1641,18 +1739,23 @@ bool updateSensors() {
 
   // ถ้าไม่ได้อยู่ใน recovery phase
   // ==================================================
-  // SENSOR SUBSYSTEM ALIVE DECISION
+  // SENSOR SUBSYSTEM ALIVE DECISION (ROBUST VERSION)
   // ==================================================
   if (i2cState == I2CRecoverState::IDLE) {
 
     if (adsCurPresent || adsVoltPresent) {
 
-      if (curConvRunning || voltConvRunning || sensorHealthyThisCycle)
+      if (curConvRunning || voltConvRunning)
         return true;
+
+      if (sensorHealthyThisCycle)
+        return true;
+
+      return true;
     }
   }
 
-  return false;  // sensor not healthy
+  return false;
 }
 
 void runDrive(uint32_t now) {
@@ -2818,16 +2921,10 @@ void loop() {
 
   wdt_reset();
 
-  if (systemState == SystemState::ACTIVE &&
-    getDriveSafety() != SafetyState::EMERGENCY &&
-    !faultLatched)
-{
-  digitalWrite(PIN_HW_WD_HB,
-               !digitalRead(PIN_HW_WD_HB));
+  if (systemState == SystemState::ACTIVE && getDriveSafety() != SafetyState::EMERGENCY && !faultLatched) {
+    digitalWrite(PIN_HW_WD_HB,
+                 !digitalRead(PIN_HW_WD_HB));
+  } else {
+    digitalWrite(PIN_HW_WD_HB, LOW);
+  }
 }
-else
-{
-  digitalWrite(PIN_HW_WD_HB, LOW);
-}
-}
-
