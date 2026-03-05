@@ -2237,8 +2237,6 @@ void applyDrive() {
 
     curL = 0;
     curR = 0;
-    targetL = 0;
-    targetR = 0;
 
     if (thrNeutral && strNeutral)
       driverRearmRequired = false;
@@ -2247,10 +2245,18 @@ void applyDrive() {
   }
 
   // ==================================================
+  // READ SENSORS (ครั้งเดียว)
+  // ==================================================
+  float curA_L = curLeft();
+  float curA_R = curRight();
+
+  float tempMax = max(tempDriverL, tempDriverR);
+
+  // ==================================================
   // COPY TARGET
   // ==================================================
-  int16_t finalTargetL = targetL;
-  int16_t finalTargetR = targetR;
+  float finalTargetL = targetL;
+  float finalTargetR = targetR;
 
   // ==================================================
   // AUTO REVERSE
@@ -2287,48 +2293,71 @@ void applyDrive() {
   }
 
   // ==================================================
-  // TRACTION CONTROL (CURRENT BASED)
+  // TRACTION CONTROL
   // ==================================================
-  float cL = curLeft();
-  float cR = curRight();
-
-  float diff = fabs(cL - cR);
+  float diff = fabs(curA_L - curA_R);
 
   constexpr float TRACTION_DIFF = 30.0f;
 
   if (diff > TRACTION_DIFF) {
 
-    if (cL > cR)
+    if (curA_L > curA_R)
       finalTargetL *= 0.75f;
     else
       finalTargetR *= 0.75f;
   }
 
   // ==================================================
+  // TORQUE LIMIT
+  // ==================================================
+  constexpr float TORQUE_SOFT = 55.0f;
+  constexpr float TORQUE_HARD = 75.0f;
+
+  if (curA_L > TORQUE_SOFT) {
+
+    float span = TORQUE_HARD - TORQUE_SOFT;
+    float excess = curA_L - TORQUE_SOFT;
+
+    float scale = 1.0f - (excess / span);
+
+    if (scale < 0.35f) scale = 0.35f;
+
+    finalTargetL *= scale;
+  }
+
+  if (curA_R > TORQUE_SOFT) {
+
+    float span = TORQUE_HARD - TORQUE_SOFT;
+    float excess = curA_R - TORQUE_SOFT;
+
+    float scale = 1.0f - (excess / span);
+
+    if (scale < 0.35f) scale = 0.35f;
+
+    finalTargetR *= scale;
+  }
+
+  // ==================================================
   // THERMAL DERATING
   // ==================================================
-  float tempMax = max(tempDriverL, tempDriverR);
-
-  float thermalScale = 1.0f;
-
   if (tempMax > TEMP_WARN_C) {
 
     float span = TEMP_TRIP_C - TEMP_WARN_C;
 
-    thermalScale =
+    float thermalScale =
       1.0f - ((tempMax - TEMP_WARN_C) / span) * 0.6f;
 
     if (thermalScale < 0.4f)
       thermalScale = 0.4f;
-  }
 
-  finalTargetL *= thermalScale;
-  finalTargetR *= thermalScale;
+    finalTargetL *= thermalScale;
+    finalTargetR *= thermalScale;
+  }
 
   // ==================================================
   // CURRENT LIMITER
   // ==================================================
-  float curMax = max(cL, cR);
+  float curMax = max(curA_L, curA_R);
 
   if (curMax > CUR_LIMP_A) {
 
@@ -2352,7 +2381,7 @@ void applyDrive() {
               PWM_TOP);
 
   // ==================================================
-  // REGEN BRAKE WINDOW
+  // REVERSE BRAKE WINDOW
   // ==================================================
   static uint32_t regenBlockUntil = 0;
 
@@ -2385,12 +2414,10 @@ void applyDrive() {
 
   int16_t stepTarget;
 
-  if (finalTargetL == 0 && finalTargetR == 0)
-    stepTarget = 2;
-  else if (driveState == DriveState::SOFT_STOP)
+  if (curMax > 60)
     stepTarget = 2;
   else if (driveState == DriveState::LIMP)
-    stepTarget = 4;
+    stepTarget = 3;
   else
     stepTarget = 5;
 
@@ -2402,7 +2429,7 @@ void applyDrive() {
   int16_t step = stepCurrent;
 
   // ==================================================
-  // DRIVER ENABLE GUARD
+  // DRIVER ENABLE
   // ==================================================
   if (!digitalRead(PIN_DRV_ENABLE)) {
 
@@ -2421,13 +2448,8 @@ void applyDrive() {
   static int8_t lastDirL = 0;
   static int8_t lastDirR = 0;
 
-  int8_t dirL =
-    (curL > 0) ? 1 :
-    (curL < 0) ? -1 : 0;
-
-  int8_t dirR =
-    (curR > 0) ? 1 :
-    (curR < 0) ? -1 : 0;
+  int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
+  int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
 
   if (dirL != lastDirL) {
 
