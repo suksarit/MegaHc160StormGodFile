@@ -1157,6 +1157,8 @@ void updateComms(uint32_t now) {
 #if DEBUG_SERIAL
       Serial.println(F("[IBUS] RECOVERED"));
 #endif
+      // reset confirmation requirement
+      requireIbusConfirm = false;
     }
 
     ibusCommLost = false;
@@ -1168,14 +1170,26 @@ void updateComms(uint32_t now) {
   // ==================================================
   // SOFT TIMEOUT (COMM LOST → EMERGENCY)
   // ==================================================
+  static uint8_t ibusLostCnt = 0;
+
   if (now - lastIbusByte_ms > 100) {
-    if (!ibusCommLost) {
+
+    if (++ibusLostCnt >= 3) {
+
+      if (!ibusCommLost) {
+
 #if DEBUG_SERIAL
-      Serial.println(F("[IBUS] SOFT LOST"));
+        Serial.println(F("[IBUS] SOFT LOST"));
 #endif
-      ibusCommLost = true;
-      requireIbusConfirm = true;
+
+        ibusCommLost = true;
+        requireIbusConfirm = true;
+      }
     }
+
+  } else {
+
+    ibusLostCnt = 0;
   }
 
   // ==================================================
@@ -1633,9 +1647,8 @@ bool updateSensors() {
 
     if (adsCurPresent || adsVoltPresent) {
 
-      if (sensorHealthyThisCycle) {
-        return true;  // sensor subsystem healthy
-      }
+      if (curConvRunning || voltConvRunning || sensorHealthyThisCycle)
+        return true;
     }
   }
 
