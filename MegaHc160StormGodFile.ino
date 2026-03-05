@@ -605,12 +605,11 @@ void detectWheelStuck(uint32_t now) {
   // ==================================================
   // CONFIG
   // ==================================================
-  constexpr int16_t MIN_PWM_FOR_STUCK = 300;  // ต้องมีแรงขับจริง
-  constexpr int16_t TURNING_DIFF_MAX = 250;   // เกินนี้ถือว่าเลี้ยว
-  constexpr uint32_t STUCK_TIME_MS = 80;      // ต้องต่อเนื่อง >= 80ms
+  constexpr int16_t MIN_PWM_FOR_STUCK = 300;   // ต้องมีแรงขับจริง
+  constexpr int16_t TURNING_DIFF_MAX = 250;    // เกินนี้ถือว่าเลี้ยว
 
   // ==================================================
-  // ต้องมีแรงขับจริง
+  // PWM magnitude
   // ==================================================
   int16_t pwmMag = max(abs(curL), abs(curR));
 
@@ -623,6 +622,9 @@ void detectWheelStuck(uint32_t now) {
   if (abs(curL - curR) > TURNING_DIFF_MAX)
     return;
 
+  // ==================================================
+  // CURRENT
+  // ==================================================
   float cL = curLeft();
   float cR = curRight();
 
@@ -638,14 +640,46 @@ void detectWheelStuck(uint32_t now) {
   float percentThreshold;
 
   if (pwmMag < 400)
-    percentThreshold = 0.35f;  // ไวขึ้น
+    percentThreshold = 0.35f;
   else if (pwmMag < 700)
-    percentThreshold = 0.45f;  // สมดุล
+    percentThreshold = 0.45f;
   else
-    percentThreshold = 0.55f;  // เข้มขึ้นที่ความเร็วสูง
+    percentThreshold = 0.55f;
 
+  // ==================================================
+  // GRASS DENSITY ESTIMATOR
+  // ==================================================
+  static float prevCur = 0;
+  static float rippleAvg = 0;
+
+  float curAvg = (cL + cR) * 0.5f;
+  float ripple = fabs(curAvg - prevCur);
+
+  prevCur = curAvg;
+
+  rippleAvg = rippleAvg * 0.85f + ripple * 0.15f;
+
+  // ถ้าหญ้าหนา → ผ่อน threshold
+  if (rippleAvg > 6.0f)
+    percentThreshold *= 1.25f;
+
+  // ==================================================
+  // DIFFERENCE
+  // ==================================================
   float diff = fabs(cL - cR);
   float percentDiff = diff / maxCur;
+
+  // ==================================================
+  // DYNAMIC STUCK TIME
+  // ==================================================
+  uint32_t stuckTime;
+
+  if (pwmMag < 400)
+    stuckTime = 700;
+  else if (pwmMag < 700)
+    stuckTime = 500;
+  else
+    stuckTime = 320;
 
   static uint32_t leftStart_ms = 0;
   static uint32_t rightStart_ms = 0;
@@ -658,7 +692,7 @@ void detectWheelStuck(uint32_t now) {
     if (leftStart_ms == 0)
       leftStart_ms = now;
 
-    if (now - leftStart_ms >= STUCK_TIME_MS) {
+    if (now - leftStart_ms >= stuckTime) {
 
       leftStart_ms = 0;
       rightStart_ms = 0;
@@ -680,7 +714,7 @@ void detectWheelStuck(uint32_t now) {
     if (rightStart_ms == 0)
       rightStart_ms = now;
 
-    if (now - rightStart_ms >= STUCK_TIME_MS) {
+    if (now - rightStart_ms >= stuckTime) {
 
       leftStart_ms = 0;
       rightStart_ms = 0;
@@ -693,6 +727,33 @@ void detectWheelStuck(uint32_t now) {
   } else {
     rightStart_ms = 0;
   }
+}
+
+bool detectMotorStall() {
+
+  static float prevCurL = 0;
+  static float prevCurR = 0;
+
+  float cL = curLeft();
+  float cR = curRight();
+
+  float dCurL = cL - prevCurL;
+  float dCurR = cR - prevCurR;
+
+  prevCurL = cL;
+  prevCurR = cR;
+
+  constexpr float STALL_CURRENT_STEP = 18.0f;
+
+  if (abs(curL) > 350 || abs(curR) > 350) {
+
+    if (dCurL > STALL_CURRENT_STEP && dCurR > STALL_CURRENT_STEP) {
+      return true;
+    }
+
+  }
+
+  return false;
 }
 
 void detectWheelLock() {
