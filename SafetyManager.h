@@ -64,3 +64,4 @@ void forceSafetyState(SafetyState s);
 const char* safetyStateToString(SafetyState s);
 
 #endif
+

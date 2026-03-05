@@ -2818,6 +2818,16 @@ void loop() {
 
   wdt_reset();
 
+  if (systemState == SystemState::ACTIVE &&
+    getDriveSafety() != SafetyState::EMERGENCY &&
+    !faultLatched)
+{
   digitalWrite(PIN_HW_WD_HB,
                !digitalRead(PIN_HW_WD_HB));
 }
+else
+{
+  digitalWrite(PIN_HW_WD_HB, LOW);
+}
+}
+
