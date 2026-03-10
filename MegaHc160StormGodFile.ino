@@ -89,7 +89,6 @@ constexpr uint8_t CH_STARTER = 10;
 // FUNCTION PROTOTYPES (FINAL / MATCH ARDUINO ABI)
 // ============================================================================
 bool readDriverTempsPT100(int &tL, int &tR);
-float readCurrentADC(uint8_t adsChannel, uint8_t idx);
 bool updateSensors(void);
 void latchFault(FaultCode code);
 void updateDriverFans(void);
@@ -402,14 +401,45 @@ constexpr uint8_t VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอ
 
 // ======================================================
 // FREE RAM (SRAM MONITOR)
+// AVR SRAM calculation
+//
+// วิธีคำนวณ
+// free RAM = stack_top - heap_top
+//
+// heap_top = __brkval
+// ถ้า heap ยังไม่ถูก allocate (__brkval == 0)
+// ให้ใช้ __heap_start แทน
+//
+// NOTE:
+// __heap_start และ __brkval เป็น symbol ภายในของ AVR libc
+// บาง toolchain อาจไม่ได้ประกาศใน header
+// จึงต้อง declare extern เอง
 // ======================================================
+
+#if defined(__AVR__)
+
 extern unsigned int __heap_start;
 extern void *__brkval;
 
-int freeRam() {
-  int v;
-  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+int freeRam()
+{
+  int stackTop;
+
+  void* heapTop = (__brkval == 0)
+                    ? (void*)&__heap_start
+                    : __brkval;
+
+  return (int)&stackTop - (int)heapTop;
 }
+
+#else
+
+int freeRam()
+{
+  return -1; // not supported on non-AVR platforms
+}
+
+#endif
 
 // ------------------------------------------------------
 
@@ -1011,6 +1041,7 @@ bool detectMotorStall() {
 void detectWheelLock() {
 
   static uint8_t lockCnt = 0;
+  static uint32_t lockStart_ms = 0;
 
   // ==================================================
   // CONFIG
@@ -1019,6 +1050,11 @@ void detectWheelLock() {
   constexpr float CURRENT_BALANCE_RATIO = 0.25f;
   constexpr uint8_t LOCK_CONFIRM_CNT = 4;
 
+  // เพิ่ม time guard
+  constexpr uint16_t LOCK_CONFIRM_MS = 400;
+
+  uint32_t now = millis();
+
   // ==================================================
   // ต้องมีแรงขับจริง
   // ==================================================
@@ -1026,6 +1062,7 @@ void detectWheelLock() {
 
   if (pwmMag < MIN_PWM_FOR_LOCK) {
     lockCnt = 0;
+    lockStart_ms = 0;
     return;
   }
 
@@ -1044,6 +1081,7 @@ void detectWheelLock() {
   // ==================================================
   if (maxCur <= 0.1f) {
     lockCnt = 0;
+    lockStart_ms = 0;
     return;
   }
 
@@ -1051,6 +1089,7 @@ void detectWheelLock() {
 
   if (balanceRatio > CURRENT_BALANCE_RATIO) {
     lockCnt = 0;
+    lockStart_ms = 0;
     return;
   }
 
@@ -1080,7 +1119,14 @@ void detectWheelLock() {
 
     if (errL < 50 && errR < 50) {
 
-      if (++lockCnt >= LOCK_CONFIRM_CNT) {
+      if (lockCnt == 0) {
+        lockStart_ms = now;
+      }
+
+      lockCnt++;
+
+      // ต้องผ่านทั้ง counter และ time guard
+      if (lockCnt >= LOCK_CONFIRM_CNT && (now - lockStart_ms) >= LOCK_CONFIRM_MS) {
 
         lastDriveEvent = DriveEvent::WHEEL_LOCK;
         latchFault(FaultCode::OVER_CURRENT);
@@ -1089,11 +1135,13 @@ void detectWheelLock() {
     } else {
 
       lockCnt = 0;
+      lockStart_ms = 0;
     }
 
   } else {
 
     lockCnt = 0;
+    lockStart_ms = 0;
   }
 }
 
@@ -1103,6 +1151,10 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   static uint32_t lastTx = 0;
   if (now - lastTx < TELEMETRY_PERIOD_MS) return;
   lastTx = now;
+
+  // buffer สำหรับสร้าง CSV
+  char line[220];
+  uint8_t chk = 0;
 
   // ================= LOOP TIME =================
   uint32_t loopTime_us = micros() - loopStart_us;
@@ -1150,56 +1202,43 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   SafetyState rawSafety =
     evaluateSafetyRaw(sin, sth);
 
-  // ================= CSV OUTPUT =================
-  Serial.print(now);
+  // ================= CSV BUILD =================
+  int n = snprintf(
+    line,
+    sizeof(line),
+    "%lu,%d,%d,%d.%d,%d.%d,%d,%d,%d.%d,%d.%d,%lu,%c,%c,%c,%c,%u,%d,%u,%u,%c,%c,%c",
+    now,
+    tempDriverL,
+    tempDriverR,
+    volt_x10 / 10, abs(volt_x10 % 10),
+    curMax_x10 / 10, abs(curMax_x10 % 10),
+    curL,
+    curR,
+    cpuLoad_x10 / 10, abs(cpuLoad_x10 % 10),
+    cpuMargin_x10 / 10, abs(cpuMargin_x10 % 10),
+    now - lastIbusByte_ms,
+    wdS,
+    wdC,
+    wdD,
+    wdB,
+    (uint8_t)activeFault,
+    freeRam(),
+    autoReverseCount,
+    (uint8_t)rawSafety,
+    adsCur,
+    adsVolt,
+    gimbalOn
+  );
+
+  // ================= CHECKSUM =================
+  for (int i = 0; i < n; i++) {
+    chk ^= line[i];
+  }
+
+  // ================= OUTPUT =================
+  Serial.print(line);
   Serial.print(',');
-  Serial.print(tempDriverL);
-  Serial.print(',');
-  Serial.print(tempDriverR);
-  Serial.print(',');
-  Serial.print(volt_x10 / 10);
-  Serial.print('.');
-  Serial.print(abs(volt_x10 % 10));
-  Serial.print(',');
-  Serial.print(curMax_x10 / 10);
-  Serial.print('.');
-  Serial.print(abs(curMax_x10 % 10));
-  Serial.print(',');
-  Serial.print(curL);
-  Serial.print(',');
-  Serial.print(curR);
-  Serial.print(',');
-  Serial.print(cpuLoad_x10 / 10);
-  Serial.print('.');
-  Serial.print(abs(cpuLoad_x10 % 10));
-  Serial.print(',');
-  Serial.print(cpuMargin_x10 / 10);
-  Serial.print('.');
-  Serial.print(abs(cpuMargin_x10 % 10));
-  Serial.print(',');
-  Serial.print(now - lastIbusByte_ms);
-  Serial.print(',');
-  Serial.print(wdS);
-  Serial.print(',');
-  Serial.print(wdC);
-  Serial.print(',');
-  Serial.print(wdD);
-  Serial.print(',');
-  Serial.print(wdB);
-  Serial.print(',');
-  Serial.print((uint8_t)activeFault);
-  Serial.print(',');
-  Serial.print(freeRam());
-  Serial.print(',');
-  Serial.print(autoReverseCount);
-  Serial.print(',');
-  Serial.print((uint8_t)rawSafety);
-  Serial.print(',');
-  Serial.print(adsCur);
-  Serial.print(',');
-  Serial.print(adsVolt);
-  Serial.print(',');
-  Serial.println(gimbalOn);
+  Serial.println(chk);
 
 #endif
 }
@@ -2088,6 +2127,9 @@ bool updateSensors() {
 
   uint32_t now = millis();
 
+  static bool sensorCycleComplete = false;
+  sensorCycleComplete = false;
+
   // ==================================================
   // SENSOR PRESENCE GUARD
   // ==================================================
@@ -2098,13 +2140,17 @@ bool updateSensors() {
   bool sensorHealthyThisCycle = false;
 
 #if TEST_MODE
+
   curA[0] = curA[1] = curA[2] = curA[3] = 5.0f;
+
   tempDriverL = 45;
   tempDriverR = 47;
+
   engineVolt = 26.0f;
 
-  wdSensor.lastUpdate_ms = now;
-  return true;
+  sensorCycleComplete = true;
+  return sensorCycleComplete;
+
 #endif
 
   // ==================================================
@@ -2364,16 +2410,19 @@ bool updateSensors() {
         float vRaw =
           v_adc * ((150.0f + 33.0f) / 33.0f);
 
-        float dv = vRaw - engineVolt;
-
-        if (dv > 8.0f) dv = 8.0f;
-        if (dv < -8.0f) dv = -8.0f;
-
-        engineVolt += 0.15f * dv;
-
+        // --------------------------------------------------
+        // PLAUSIBILITY CHECK
+        // --------------------------------------------------
         if (vRaw > 0.0f && vRaw < 40.0f) {
 
-          engineVolt += 0.15f * (vRaw - engineVolt);
+          float dv = vRaw - engineVolt;
+
+          // limit step change (anti spike)
+          if (dv > 8.0f) dv = 8.0f;
+          if (dv < -8.0f) dv = -8.0f;
+
+          // single LPF
+          engineVolt += 0.15f * dv;
 
           lastVoltOk_ms = now;
           sensorHealthyThisCycle = true;
@@ -2898,7 +2947,7 @@ void applyDrive() {
   // --------------------------------------------------
   if (reverseBrakeActive) {
 
-  if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
+    if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
 
       setPWM_L(0);
       setPWM_R(0);
@@ -2908,13 +2957,13 @@ void applyDrive() {
       return;
     } else {
 
-  reverseBrakeActive = false;
+      reverseBrakeActive = false;
 
-  digitalWrite(DIR_L1, LOW);
-  digitalWrite(DIR_L2, LOW);
-  digitalWrite(DIR_R1, LOW);
-  digitalWrite(DIR_R2, LOW);
-}
+      digitalWrite(DIR_L1, LOW);
+      digitalWrite(DIR_L2, LOW);
+      digitalWrite(DIR_R1, LOW);
+      digitalWrite(DIR_R2, LOW);
+    }
   }
 
   // ==================================================
@@ -2948,98 +2997,93 @@ void applyDrive() {
   curR = ramp(curR, finalTargetR, step);
 
   // ==================================================
-// SAFE DIR SWITCH (H-BRIDGE SHOOT-THROUGH PROTECTION)
-// ==================================================
+  // SAFE DIR SWITCH (H-BRIDGE SHOOT-THROUGH PROTECTION)
+  // ==================================================
 
-static int8_t lastDirL = 0;
-static int8_t lastDirR = 0;
+  static int8_t lastDirL = 0;
+  static int8_t lastDirR = 0;
 
-static bool dirSwitchPendingL = false;
-static bool dirSwitchPendingR = false;
+  static bool dirSwitchPendingL = false;
+  static bool dirSwitchPendingR = false;
 
-static uint32_t dirSwitchStartL_us = 0;
-static uint32_t dirSwitchStartR_us = 0;
+  static uint32_t dirSwitchStartL_us = 0;
+  static uint32_t dirSwitchStartR_us = 0;
 
-static uint32_t pwmResumeL_us = 0;
-static uint32_t pwmResumeR_us = 0;
+  static uint32_t pwmResumeL_us = 0;
+  static uint32_t pwmResumeR_us = 0;
 
-constexpr uint16_t DIR_DEADTIME_US = 1000;
-constexpr uint16_t PWM_RESUME_DELAY_US = 600;
+  constexpr uint16_t DIR_DEADTIME_US = 1000;
+  constexpr uint16_t PWM_RESUME_DELAY_US = 600;
 
-int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
-int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
+  int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
+  int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
 
-uint32_t now_us = micros();
+  uint32_t now_us = micros();
 
-// --------------------------------------------------
-// LEFT MOTOR DIR CHANGE
-// --------------------------------------------------
+  // --------------------------------------------------
+  // LEFT MOTOR DIR CHANGE
+  // --------------------------------------------------
 
-if (dirL != lastDirL && !dirSwitchPendingL) {
+  if (dirL != lastDirL && !dirSwitchPendingL) {
 
-  setPWM_L(0);
+    setPWM_L(0);
 
-  digitalWrite(DIR_L1, LOW);
-  digitalWrite(DIR_L2, LOW);
+    digitalWrite(DIR_L1, LOW);
+    digitalWrite(DIR_L2, LOW);
 
-  dirSwitchPendingL = true;
-  dirSwitchStartL_us = now_us;
-}
+    dirSwitchPendingL = true;
+    dirSwitchStartL_us = now_us;
+  }
 
-if (dirSwitchPendingL &&
-    now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
+  if (dirSwitchPendingL && now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
 
-  digitalWrite(DIR_L1, dirL > 0);
-  digitalWrite(DIR_L2, dirL < 0);
+    digitalWrite(DIR_L1, dirL > 0);
+    digitalWrite(DIR_L2, dirL < 0);
 
-  pwmResumeL_us = now_us;
+    pwmResumeL_us = now_us;
 
-  dirSwitchPendingL = false;
-  lastDirL = dirL;
-}
+    dirSwitchPendingL = false;
+    lastDirL = dirL;
+  }
 
-// --------------------------------------------------
-// RIGHT MOTOR DIR CHANGE
-// --------------------------------------------------
+  // --------------------------------------------------
+  // RIGHT MOTOR DIR CHANGE
+  // --------------------------------------------------
 
-if (dirR != lastDirR && !dirSwitchPendingR) {
+  if (dirR != lastDirR && !dirSwitchPendingR) {
 
-  setPWM_R(0);
+    setPWM_R(0);
 
-  digitalWrite(DIR_R1, LOW);
-  digitalWrite(DIR_R2, LOW);
+    digitalWrite(DIR_R1, LOW);
+    digitalWrite(DIR_R2, LOW);
 
-  dirSwitchPendingR = true;
-  dirSwitchStartR_us = now_us;
-}
+    dirSwitchPendingR = true;
+    dirSwitchStartR_us = now_us;
+  }
 
-if (dirSwitchPendingR &&
-    now_us - dirSwitchStartR_us >= DIR_DEADTIME_US) {
+  if (dirSwitchPendingR && now_us - dirSwitchStartR_us >= DIR_DEADTIME_US) {
 
-  digitalWrite(DIR_R1, dirR > 0);
-  digitalWrite(DIR_R2, dirR < 0);
+    digitalWrite(DIR_R1, dirR > 0);
+    digitalWrite(DIR_R2, dirR < 0);
 
-  pwmResumeR_us = now_us;
+    pwmResumeR_us = now_us;
 
-  dirSwitchPendingR = false;
-  lastDirR = dirR;
-}
+    dirSwitchPendingR = false;
+    lastDirR = dirR;
+  }
 
-// --------------------------------------------------
-// APPLY PWM WITH RESUME DELAY
-// --------------------------------------------------
+  // --------------------------------------------------
+  // APPLY PWM WITH RESUME DELAY
+  // --------------------------------------------------
 
-uint16_t pwmL = abs(curL);
-uint16_t pwmR = abs(curR);
+  uint16_t pwmL = abs(curL);
+  uint16_t pwmR = abs(curR);
 
-if (micros() - pwmResumeL_us < PWM_RESUME_DELAY_US)
-  pwmL = 0;
+  if (micros() - pwmResumeL_us < PWM_RESUME_DELAY_US)
+    pwmL = 0;
 
-if (micros() - pwmResumeR_us < PWM_RESUME_DELAY_US)
-  pwmR = 0;
-
-setPWM_L(pwmL);
-setPWM_R(pwmR);
+  setPWM_L(pwmL);
+  setPWM_R(pwmR);
 }
 
 // ============================================================================
@@ -3307,6 +3351,16 @@ void updateSystemState(uint32_t now) {
   static uint32_t ibusStableStart_ms = 0;
 
   bool ignitionOn = ignitionActive;
+
+  // --------------------------------------------------
+  // AUTO REVERSE COUNTER RESET ON FAULT / DISARM
+  // --------------------------------------------------
+
+  if (systemState != SystemState::ACTIVE) {
+
+    autoReverseCount = 0;
+    autoReverseActive = false;
+  }
 
   // ------------------------------------------------
   // HARD FAULT PRIORITY
@@ -3714,25 +3768,36 @@ void loop() {
   // ==================================================
   // PHASE 2 : SENSORS
   // ==================================================
+
   uint32_t tSensor_us = micros();
 
-  bool sensorAlive = updateSensors();
+  bool sensorCycleDone = updateSensors();
 
   uint32_t dtSensor = micros() - tSensor_us;
 
   static uint8_t sensorBudgetCnt = 0;
 
-  if (dtSensor > BUDGET_SENSORS_MS * 1000UL) {
+  // --------------------------------------------------
+  // SENSOR BUDGET CHECK
+  // --------------------------------------------------
 
-    if (++sensorBudgetCnt >= PHASE_BUDGET_CONFIRM)
+  if (dtSensor > (BUDGET_SENSORS_MS * 1000UL)) {
+
+    if (++sensorBudgetCnt >= PHASE_BUDGET_CONFIRM) {
       latchFault(FaultCode::SENSOR_TIMEOUT);
+    }
 
   } else {
 
     sensorBudgetCnt = 0;
+  }
 
-    if (sensorAlive)
-      wdSensor.lastUpdate_ms = now;
+  // --------------------------------------------------
+  // SENSOR WATCHDOG FEED
+  // --------------------------------------------------
+
+  if (sensorCycleDone) {
+    wdSensor.lastUpdate_ms = now;
   }
 
   // ==================================================
@@ -4092,4 +4157,3 @@ void loop() {
   // update loop progress marker
   lastLoopProgress_ms = now;
 }
-
