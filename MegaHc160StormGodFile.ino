@@ -1,5 +1,5 @@
 // ========================================================================================
-// MegaHc160Storm32.ino  - RC Lawn Mower By TN MOWER
+// MegaHc160Storm32.ino  - By TN MOWER
 // ควบคุมรถบังคับตัดหญ้า Mega2560 + FlySky IBUS + HC160AS2 + Storm32BGC
 // ========================================================================================
 
@@ -2174,12 +2174,11 @@ bool updateSensors() {
 
     case I2CRecoverState::DONE:
 
-      static uint32_t lastRecover_ms = 0;
-
       if (i2cResetCount >= 3) {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
       }
 
+      // update cooldown timer
       lastRecover_ms = now;
 
       i2cState = I2CRecoverState::IDLE;
@@ -2982,17 +2981,16 @@ void applyDrive() {
 
   if (dirL != lastDirL && !dirSwitchPendingL) {
 
-    // ตัด PWM ก่อน
-    setPWM_L(0);
-    curL = 0;
+  // stop PWM before direction change
+  setPWM_L(0);
 
-    // ตั้ง DIR เป็น neutral
-    digitalWrite(DIR_L1, LOW);
-    digitalWrite(DIR_L2, LOW);
+  // set neutral direction
+  digitalWrite(DIR_L1, LOW);
+  digitalWrite(DIR_L2, LOW);
 
-    dirSwitchPendingL = true;
-    dirSwitchStartL_us = now_us;
-  }
+  dirSwitchPendingL = true;
+  dirSwitchStartL_us = now_us;
+}
 
   if (dirSwitchPendingL && now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
 
@@ -3007,17 +3005,16 @@ void applyDrive() {
   // RIGHT MOTOR DIR CHANGE
   // --------------------------------------------------
 
-  if (dirR != lastDirR && !dirSwitchPendingR) {
+ if (dirR != lastDirR && !dirSwitchPendingR) {
 
-    setPWM_R(0);
-    curR = 0;
+  setPWM_R(0);
 
-    digitalWrite(DIR_R1, LOW);
-    digitalWrite(DIR_R2, LOW);
+  digitalWrite(DIR_R1, LOW);
+  digitalWrite(DIR_R2, LOW);
 
-    dirSwitchPendingR = true;
-    dirSwitchStartR_us = now_us;
-  }
+  dirSwitchPendingR = true;
+  dirSwitchStartR_us = now_us;
+}
 
   if (dirSwitchPendingR && now_us - dirSwitchStartR_us >= DIR_DEADTIME_US) {
 
@@ -3040,1055 +3037,1055 @@ void applyDrive() {
 
   setPWM_L(pwmL);
   setPWM_R(pwmR);
- }
- 
-  // ============================================================================
-  // FAULT HANDLER (SINGLE POINT OF CUT / HARD SAFE)
-  // ============================================================================
-  void handleFaultImmediateCut() {
+}
+
+// ============================================================================
+// FAULT HANDLER (SINGLE POINT OF CUT / HARD SAFE)
+// ============================================================================
+void handleFaultImmediateCut() {
 #if DEBUG_SERIAL
-    static bool printed = false;
-    if (!printed) {
-      Serial.println(F("[FAULT] IMMEDIATE CUT"));
-      printed = true;
-    }
+  static bool printed = false;
+  if (!printed) {
+    Serial.println(F("[FAULT] IMMEDIATE CUT"));
+    printed = true;
+  }
 #endif
 
-    // --------------------------------------------------
-    // 1) DISABLE DRIVER POWER
-    // --------------------------------------------------
-    digitalWrite(PIN_DRV_ENABLE, LOW);
+  // --------------------------------------------------
+  // 1) DISABLE DRIVER POWER
+  // --------------------------------------------------
+  digitalWrite(PIN_DRV_ENABLE, LOW);
 
-    // --------------------------------------------------
-    // 2) CUT DRIVE OUTPUT
-    // --------------------------------------------------
-    driveSafe();
-    curL = 0;
-    curR = 0;
-    targetL = 0;
-    targetR = 0;
+  // --------------------------------------------------
+  // 2) CUT DRIVE OUTPUT
+  // --------------------------------------------------
+  driveSafe();
+  curL = 0;
+  curR = 0;
+  targetL = 0;
+  targetR = 0;
 
-    // --------------------------------------------------
-    // 3) CUT BLADE THROTTLE
-    // --------------------------------------------------
-    bladeServo.writeMicroseconds(1000);
+  // --------------------------------------------------
+  // 3) CUT BLADE THROTTLE
+  // --------------------------------------------------
+  bladeServo.writeMicroseconds(1000);
 
-    // --------------------------------------------------
-    // 4) CUT STARTER
-    // --------------------------------------------------
+  // --------------------------------------------------
+  // 4) CUT STARTER
+  // --------------------------------------------------
+  starterActive = false;
+  digitalWrite(RELAY_STARTER, LOW);
+}
+
+void updateIgnition() {
+
+  static bool ignitionLatched = false;  // logical debounced state
+  static bool lastRawRequest = false;
+  static uint32_t edgeStart_ms = 0;
+
+  constexpr uint32_t IGNITION_DEBOUNCE_MS = 50;
+
+  uint32_t now = millis();
+
+  uint16_t ch6 = ibus.readChannel(CH_IGNITION);
+  bool rawRequest = (ch6 > 1600);
+
+  // --------------------------------------------------
+  // HARD SAFETY
+  // --------------------------------------------------
+  if (faultLatched || ibusCommLost) {
+
+    ignitionLatched = false;
+    ignitionActive = false;  // <<< UPDATE LOGICAL STATE
+
+    digitalWrite(RELAY_IGNITION, LOW);
+
+    lastRawRequest = rawRequest;
+    edgeStart_ms = 0;
+    return;
+  }
+
+  // --------------------------------------------------
+  // EDGE DETECTION
+  // --------------------------------------------------
+  if (rawRequest != lastRawRequest) {
+    edgeStart_ms = now;
+    lastRawRequest = rawRequest;
+  }
+
+  // --------------------------------------------------
+  // DEBOUNCE
+  // --------------------------------------------------
+  if (edgeStart_ms != 0 && (now - edgeStart_ms >= IGNITION_DEBOUNCE_MS)) {
+
+    ignitionLatched = rawRequest;
+    edgeStart_ms = 0;
+  }
+
+  // --------------------------------------------------
+  // UPDATE GLOBAL LOGICAL STATE
+  // --------------------------------------------------
+  ignitionActive = ignitionLatched;
+
+  // --------------------------------------------------
+  // APPLY OUTPUT
+  // --------------------------------------------------
+  digitalWrite(RELAY_IGNITION,
+               ignitionLatched ? HIGH : LOW);
+}
+
+void updateStarter(uint32_t now) {
+
+  uint16_t ch10 = ibus.readChannel(CH_STARTER);
+  bool requestStart = (ch10 > 1600);
+
+  bool ignitionOn = ignitionActive;
+
+  // =====================================================
+  // 1️⃣ HARD SAFETY GATE (BLOCK EVERYTHING)
+  // =====================================================
+  if (systemState == SystemState::FAULT || driveState != DriveState::IDLE || ibus.readChannel(CH_ENGINE) > 1100 || !neutral(ibus.readChannel(CH_THROTTLE)) || !ignitionOn || engineRunning || (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS)) {
+
     starterActive = false;
     digitalWrite(RELAY_STARTER, LOW);
+    return;
   }
 
-  void updateIgnition() {
+  // =====================================================
+  // 2️⃣ IF STARTER IS ACTIVE → HANDLE TIMEOUT ONLY
+  // =====================================================
+  if (starterActive) {
 
-    static bool ignitionLatched = false;  // logical debounced state
-    static bool lastRawRequest = false;
-    static uint32_t edgeStart_ms = 0;
-
-    constexpr uint32_t IGNITION_DEBOUNCE_MS = 50;
-
-    uint32_t now = millis();
-
-    uint16_t ch6 = ibus.readChannel(CH_IGNITION);
-    bool rawRequest = (ch6 > 1600);
-
-    // --------------------------------------------------
-    // HARD SAFETY
-    // --------------------------------------------------
-    if (faultLatched || ibusCommLost) {
-
-      ignitionLatched = false;
-      ignitionActive = false;  // <<< UPDATE LOGICAL STATE
-
-      digitalWrite(RELAY_IGNITION, LOW);
-
-      lastRawRequest = rawRequest;
-      edgeStart_ms = 0;
-      return;
-    }
-
-    // --------------------------------------------------
-    // EDGE DETECTION
-    // --------------------------------------------------
-    if (rawRequest != lastRawRequest) {
-      edgeStart_ms = now;
-      lastRawRequest = rawRequest;
-    }
-
-    // --------------------------------------------------
-    // DEBOUNCE
-    // --------------------------------------------------
-    if (edgeStart_ms != 0 && (now - edgeStart_ms >= IGNITION_DEBOUNCE_MS)) {
-
-      ignitionLatched = rawRequest;
-      edgeStart_ms = 0;
-    }
-
-    // --------------------------------------------------
-    // UPDATE GLOBAL LOGICAL STATE
-    // --------------------------------------------------
-    ignitionActive = ignitionLatched;
-
-    // --------------------------------------------------
-    // APPLY OUTPUT
-    // --------------------------------------------------
-    digitalWrite(RELAY_IGNITION,
-                 ignitionLatched ? HIGH : LOW);
-  }
-
-  void updateStarter(uint32_t now) {
-
-    uint16_t ch10 = ibus.readChannel(CH_STARTER);
-    bool requestStart = (ch10 > 1600);
-
-    bool ignitionOn = ignitionActive;
-
-    // =====================================================
-    // 1️⃣ HARD SAFETY GATE (BLOCK EVERYTHING)
-    // =====================================================
-    if (systemState == SystemState::FAULT || driveState != DriveState::IDLE || ibus.readChannel(CH_ENGINE) > 1100 || !neutral(ibus.readChannel(CH_THROTTLE)) || !ignitionOn || engineRunning || (engineStopped_ms != 0 && now - engineStopped_ms < ENGINE_RESTART_GUARD_MS)) {
+    if (!requestStart || (now - starterStart_ms > STARTER_MAX_MS)) {
 
       starterActive = false;
       digitalWrite(RELAY_STARTER, LOW);
-      return;
-    }
 
-    // =====================================================
-    // 2️⃣ IF STARTER IS ACTIVE → HANDLE TIMEOUT ONLY
-    // =====================================================
-    if (starterActive) {
-
-      if (!requestStart || (now - starterStart_ms > STARTER_MAX_MS)) {
-
-        starterActive = false;
-        digitalWrite(RELAY_STARTER, LOW);
-
-        // ถ้าเครื่องยังไม่ติด → ถือว่าสตาร์ทล้มเหลว
-        if (!engineRunning) {
-          engineStopped_ms = now;
-        }
+      // ถ้าเครื่องยังไม่ติด → ถือว่าสตาร์ทล้มเหลว
+      if (!engineRunning) {
+        engineStopped_ms = now;
       }
-
-      return;
     }
 
-    // =====================================================
-    // 3️⃣ NEW START REQUEST
-    // =====================================================
-    if (requestStart) {
-
-      starterActive = true;
-      starterStart_ms = now;
-      digitalWrite(RELAY_STARTER, HIGH);
-    }
+    return;
   }
 
-  // ============================================================================
-  // VOLTAGE WARNING (AUTO LOGIC ONLY – NO CH_RESET)
-  // ============================================================================
-  void updateVoltageWarning(uint32_t now) {
-    static uint32_t lastToggle_ms = 0;
-    static bool buzzerOn = false;
-    float v24 = engineVolt;
+  // =====================================================
+  // 3️⃣ NEW START REQUEST
+  // =====================================================
+  if (requestStart) {
 
-    if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
-      digitalWrite(PIN_BUZZER, LOW);
-      digitalWrite(RELAY_WARN, LOW);
-      buzzerOn = false;
-      return;
-    }
+    starterActive = true;
+    starterStart_ms = now;
+    digitalWrite(RELAY_STARTER, HIGH);
+  }
+}
 
-    if (v24 >= V_WARN_LOW) {
-      digitalWrite(PIN_BUZZER, LOW);
-      digitalWrite(RELAY_WARN, LOW);
-      buzzerOn = false;
-      return;
-    }
+// ============================================================================
+// VOLTAGE WARNING (AUTO LOGIC ONLY – NO CH_RESET)
+// ============================================================================
+void updateVoltageWarning(uint32_t now) {
+  static uint32_t lastToggle_ms = 0;
+  static bool buzzerOn = false;
+  float v24 = engineVolt;
 
-    // LEVEL 1
-    if (v24 < V_WARN_LOW && v24 >= V_WARN_CRITICAL) {
-      digitalWrite(RELAY_WARN, HIGH);
-
-      if (now - lastToggle_ms >= 500) {
-        lastToggle_ms = now;
-        buzzerOn = !buzzerOn;
-        digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
-      }
-      return;
-    }
-
-    // LEVEL 2
-    if (v24 < V_WARN_CRITICAL) {
-      digitalWrite(PIN_BUZZER, HIGH);
-      digitalWrite(RELAY_WARN, HIGH);
-    }
+  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(RELAY_WARN, LOW);
+    buzzerOn = false;
+    return;
   }
 
-  void debugTestMode(uint32_t now) {
+  if (v24 >= V_WARN_LOW) {
+    digitalWrite(PIN_BUZZER, LOW);
+    digitalWrite(RELAY_WARN, LOW);
+    buzzerOn = false;
+    return;
+  }
+
+  // LEVEL 1
+  if (v24 < V_WARN_LOW && v24 >= V_WARN_CRITICAL) {
+    digitalWrite(RELAY_WARN, HIGH);
+
+    if (now - lastToggle_ms >= 500) {
+      lastToggle_ms = now;
+      buzzerOn = !buzzerOn;
+      digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
+    }
+    return;
+  }
+
+  // LEVEL 2
+  if (v24 < V_WARN_CRITICAL) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    digitalWrite(RELAY_WARN, HIGH);
+  }
+}
+
+void debugTestMode(uint32_t now) {
 #if TEST_MODE && DEBUG_SERIAL
-    static uint32_t lastPrint = 0;
-    if (now - lastPrint < 500) return;  // 2 Hz
-    lastPrint = now;
-    Serial.print(F("[TEST MODE] "));
-    Serial.print(F("Drive="));
-    Serial.print((uint8_t)driveState);
-    Serial.print(F(" Blade="));
-    Serial.print((uint8_t)bladeState);
-    Serial.print(F(" | PWM L/R="));
-    Serial.print(curL);
-    Serial.print(F("/"));
-    Serial.print(curR);
-    Serial.print(F(" | Cur(A)="));
-    for (uint8_t i = 0; i < 4; i++) {
-      Serial.print(curA[i], 1);
-      Serial.print(F(" "));
-    }
-    Serial.print(tempDriverL);
-    Serial.print(F("/"));
-    Serial.print(tempDriverR);
-    Serial.println();
-#endif
+  static uint32_t lastPrint = 0;
+  if (now - lastPrint < 500) return;  // 2 Hz
+  lastPrint = now;
+  Serial.print(F("[TEST MODE] "));
+  Serial.print(F("Drive="));
+  Serial.print((uint8_t)driveState);
+  Serial.print(F(" Blade="));
+  Serial.print((uint8_t)bladeState);
+  Serial.print(F(" | PWM L/R="));
+  Serial.print(curL);
+  Serial.print(F("/"));
+  Serial.print(curR);
+  Serial.print(F(" | Cur(A)="));
+  for (uint8_t i = 0; i < 4; i++) {
+    Serial.print(curA[i], 1);
+    Serial.print(F(" "));
   }
+  Serial.print(tempDriverL);
+  Serial.print(F("/"));
+  Serial.print(tempDriverR);
+  Serial.println();
+#endif
+}
 
-  void debugTelemetry(uint32_t now) {
+void debugTelemetry(uint32_t now) {
 #if DEBUG_SERIAL
-    static uint32_t lastPrint = 0;
-    if (now - lastPrint < 200) return;  // 5 Hz
-    lastPrint = now;
-    Serial.print(F("[TEL] "));
-    Serial.print(F("S="));
-    Serial.print((uint8_t)systemState);
-    Serial.print(F(" D="));
-    Serial.print((uint8_t)driveState);
-    Serial.print(F(" B="));
-    Serial.print((uint8_t)bladeState);
-    Serial.print(F(" | IbusAge="));
-    Serial.print(now - lastIbusByte_ms);
-    Serial.print(F(" | Cur="));
-    for (int i = 0; i < 4; i++) {
-      Serial.print(curA[i]);
-      Serial.print(F(" "));
-    }
-    Serial.print(F(" | TdL="));
-    Serial.print(tempDriverL);
-    Serial.print(F(" TdR="));
-    Serial.print(tempDriverR);
-    Serial.print(F(" | PWM="));
-    Serial.print(curL);
-    Serial.print(F("/"));
-    Serial.println(curR);
-    Serial.print(F(" | V24="));
-    Serial.print(engineVolt, 1);
-    Serial.print(F(" ER="));
-    Serial.print(engineRunning ? 1 : 0);
-#endif
+  static uint32_t lastPrint = 0;
+  if (now - lastPrint < 200) return;  // 5 Hz
+  lastPrint = now;
+  Serial.print(F("[TEL] "));
+  Serial.print(F("S="));
+  Serial.print((uint8_t)systemState);
+  Serial.print(F(" D="));
+  Serial.print((uint8_t)driveState);
+  Serial.print(F(" B="));
+  Serial.print((uint8_t)bladeState);
+  Serial.print(F(" | IbusAge="));
+  Serial.print(now - lastIbusByte_ms);
+  Serial.print(F(" | Cur="));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(curA[i]);
+    Serial.print(F(" "));
   }
+  Serial.print(F(" | TdL="));
+  Serial.print(tempDriverL);
+  Serial.print(F(" TdR="));
+  Serial.print(tempDriverR);
+  Serial.print(F(" | PWM="));
+  Serial.print(curL);
+  Serial.print(F("/"));
+  Serial.println(curR);
+  Serial.print(F(" | V24="));
+  Serial.print(engineVolt, 1);
+  Serial.print(F(" ER="));
+  Serial.print(engineRunning ? 1 : 0);
+#endif
+}
 
-  void debugIBus(uint32_t now) {
+void debugIBus(uint32_t now) {
 #if DEBUG_SERIAL
-    static uint32_t lastPrint = 0;
-    if (now - lastPrint < 500) return;
-    lastPrint = now;
-    Serial.print(F("[IBUS] "));
-    Serial.print(F("THR="));
-    Serial.print(ibus.readChannel(CH_THROTTLE));
-    Serial.print(F(" STR="));
-    Serial.print(ibus.readChannel(CH_STEER));
-    Serial.print(F(" ENG="));
-    Serial.print(ibus.readChannel(CH_ENGINE));
+  static uint32_t lastPrint = 0;
+  if (now - lastPrint < 500) return;
+  lastPrint = now;
+  Serial.print(F("[IBUS] "));
+  Serial.print(F("THR="));
+  Serial.print(ibus.readChannel(CH_THROTTLE));
+  Serial.print(F(" STR="));
+  Serial.print(ibus.readChannel(CH_STEER));
+  Serial.print(F(" ENG="));
+  Serial.print(ibus.readChannel(CH_ENGINE));
 #endif
+}
+
+// ============================================================================
+// SYSTEM STATE MACHINE (IGNITION = MASTER SAFETY KEY)
+// ============================================================================
+void updateSystemState(uint32_t now) {
+  static uint32_t ibusStableStart_ms = 0;
+
+  bool ignitionOn = ignitionActive;
+
+  // ------------------------------------------------
+  // HARD FAULT PRIORITY
+  // ------------------------------------------------
+  if (faultLatched) {
+    systemState = SystemState::FAULT;
+    return;
   }
 
-  // ============================================================================
-  // SYSTEM STATE MACHINE (IGNITION = MASTER SAFETY KEY)
-  // ============================================================================
-  void updateSystemState(uint32_t now) {
-    static uint32_t ibusStableStart_ms = 0;
+  // ------------------------------------------------
+  // IGNITION OFF = DISARM SYSTEM
+  // ------------------------------------------------
+  if (!ignitionOn) {
+    systemState = SystemState::INIT;
+    ibusStableStart_ms = 0;
+    return;
+  }
 
-    bool ignitionOn = ignitionActive;
+  switch (systemState) {
+    // --------------------------------------------
+    case SystemState::INIT:
+      {
+        // --- RESET DRIVER REARM ---
+        extern bool driverRearmRequired;
+        driverRearmRequired = true;
 
-    // ------------------------------------------------
-    // HARD FAULT PRIORITY
-    // ------------------------------------------------
-    if (faultLatched) {
+        if (ibusCommLost) {
+          ibusStableStart_ms = 0;
+          return;
+        }
+
+        if (ibusStableStart_ms == 0) {
+          ibusStableStart_ms = now;
+          return;
+        }
+
+        if (now - ibusStableStart_ms < 1000)
+          return;
+
+        bool thrNeutral = neutral(ibus.readChannel(CH_THROTTLE));
+        bool strNeutral = neutral(ibus.readChannel(CH_STEER));
+
+        // ต้องผ่าน neutral ก่อน
+        if (!rcNeutralConfirmed) {
+
+          if (thrNeutral && strNeutral) {
+            rcNeutralConfirmed = true;
+          }
+
+          return;
+        }
+
+        if (!calibrateCurrentOffsetNonBlocking(now))
+          return;
+
+        systemState = SystemState::ACTIVE;
+
+        break;
+      }
+
+    // --------------------------------------------
+    case SystemState::ACTIVE:
+      {
+        if (ibusCommLost) {
+          systemState = SystemState::INIT;
+          ibusStableStart_ms = 0;
+        }
+        break;
+      }
+
+    // --------------------------------------------
+    case SystemState::FAULT:
+      break;
+
+    default:
+      latchFault(FaultCode::LOGIC_WATCHDOG);
       systemState = SystemState::FAULT;
-      return;
-    }
+      break;
+  }
+}
 
-    // ------------------------------------------------
-    // IGNITION OFF = DISARM SYSTEM
-    // ------------------------------------------------
-    if (!ignitionOn) {
-      systemState = SystemState::INIT;
-      ibusStableStart_ms = 0;
-      return;
-    }
+// ============================================================================
+// SAFE FAULT RESET VIA IGNITION TOGGLE (SINGLE SAFETY KEY)
+// ต้องดับ ignition ≥3 วินาที แล้วเปิดใหม่ พร้อมเงื่อนไข safe ครบ
+// ============================================================================
+void processFaultReset(uint32_t now) {
+  static bool ignitionWasOn = false;
+  static uint32_t ignitionOffStart_ms = 0;
+  static bool ignitionOffQualified = false;
 
-    switch (systemState) {
-      // --------------------------------------------
-      case SystemState::INIT:
-        {
-          // --- RESET DRIVER REARM ---
-          extern bool driverRearmRequired;
-          driverRearmRequired = true;
+  if (!faultLatched)
+    return;
 
-          if (ibusCommLost) {
-            ibusStableStart_ms = 0;
-            return;
-          }
+  bool ignitionNow = ignitionActive;
 
-          if (ibusStableStart_ms == 0) {
-            ibusStableStart_ms = now;
-            return;
-          }
+  // --------------------------------------------------
+  // DETECT IGNITION OFF PERIOD
+  // --------------------------------------------------
+  if (!ignitionNow) {
+    if (ignitionWasOn)
+      ignitionOffStart_ms = now;
 
-          if (now - ibusStableStart_ms < 1000)
-            return;
-
-          bool thrNeutral = neutral(ibus.readChannel(CH_THROTTLE));
-          bool strNeutral = neutral(ibus.readChannel(CH_STEER));
-
-          // ต้องผ่าน neutral ก่อน
-          if (!rcNeutralConfirmed) {
-
-            if (thrNeutral && strNeutral) {
-              rcNeutralConfirmed = true;
-            }
-
-            return;
-          }
-
-          if (!calibrateCurrentOffsetNonBlocking(now))
-            return;
-
-          systemState = SystemState::ACTIVE;
-
-          break;
-        }
-
-      // --------------------------------------------
-      case SystemState::ACTIVE:
-        {
-          if (ibusCommLost) {
-            systemState = SystemState::INIT;
-            ibusStableStart_ms = 0;
-          }
-          break;
-        }
-
-      // --------------------------------------------
-      case SystemState::FAULT:
-        break;
-
-      default:
-        latchFault(FaultCode::LOGIC_WATCHDOG);
-        systemState = SystemState::FAULT;
-        break;
+    if (ignitionOffStart_ms != 0 && (now - ignitionOffStart_ms >= 3000)) {
+      ignitionOffQualified = true;
     }
   }
 
-  // ============================================================================
-  // SAFE FAULT RESET VIA IGNITION TOGGLE (SINGLE SAFETY KEY)
-  // ต้องดับ ignition ≥3 วินาที แล้วเปิดใหม่ พร้อมเงื่อนไข safe ครบ
-  // ============================================================================
-  void processFaultReset(uint32_t now) {
-    static bool ignitionWasOn = false;
-    static uint32_t ignitionOffStart_ms = 0;
-    static bool ignitionOffQualified = false;
+  // --------------------------------------------------
+  // SAFE CONDITIONS
+  // --------------------------------------------------
+  bool throttleNeutral = neutral(ibus.readChannel(CH_THROTTLE));
+  bool steerNeutral = neutral(ibus.readChannel(CH_STEER));
+  bool engineIdle = (ibus.readChannel(CH_ENGINE) < 1100);
 
-    if (!faultLatched)
-      return;
+  bool driveIdle =
+    (driveState == DriveState::IDLE || driveState == DriveState::LOCKED);
 
-    bool ignitionNow = ignitionActive;
+  bool bladeSafe =
+    (bladeState == BladeState::IDLE || bladeState == BladeState::LOCKED);
 
-    // --------------------------------------------------
-    // DETECT IGNITION OFF PERIOD
-    // --------------------------------------------------
-    if (!ignitionNow) {
-      if (ignitionWasOn)
-        ignitionOffStart_ms = now;
+  bool currentSafe = true;
+  for (uint8_t i = 0; i < 4; i++)
+    if (curA[i] > CUR_WARN_A)
+      currentSafe = false;
 
-      if (ignitionOffStart_ms != 0 && (now - ignitionOffStart_ms >= 3000)) {
-        ignitionOffQualified = true;
-      }
-    }
+  bool tempSafe =
+    (tempDriverL < TEMP_WARN_C && tempDriverR < TEMP_WARN_C);
 
-    // --------------------------------------------------
-    // SAFE CONDITIONS
-    // --------------------------------------------------
-    bool throttleNeutral = neutral(ibus.readChannel(CH_THROTTLE));
-    bool steerNeutral = neutral(ibus.readChannel(CH_STEER));
-    bool engineIdle = (ibus.readChannel(CH_ENGINE) < 1100);
+  bool voltSafe = (engineVolt > V_WARN_LOW);
 
-    bool driveIdle =
-      (driveState == DriveState::IDLE || driveState == DriveState::LOCKED);
+  bool safetyClear =
+    (getDriveSafety() != SafetyState::EMERGENCY);
 
-    bool bladeSafe =
-      (bladeState == BladeState::IDLE || bladeState == BladeState::LOCKED);
+  bool allSafe =
+    throttleNeutral && steerNeutral && engineIdle && driveIdle && bladeSafe && currentSafe && tempSafe && voltSafe && safetyClear;
 
-    bool currentSafe = true;
-    for (uint8_t i = 0; i < 4; i++)
-      if (curA[i] > CUR_WARN_A)
-        currentSafe = false;
-
-    bool tempSafe =
-      (tempDriverL < TEMP_WARN_C && tempDriverR < TEMP_WARN_C);
-
-    bool voltSafe = (engineVolt > V_WARN_LOW);
-
-    bool safetyClear =
-      (getDriveSafety() != SafetyState::EMERGENCY);
-
-    bool allSafe =
-      throttleNeutral && steerNeutral && engineIdle && driveIdle && bladeSafe && currentSafe && tempSafe && voltSafe && safetyClear;
-
-    // --------------------------------------------------
-    // EXECUTE RESET ON RISING EDGE OF IGNITION
-    // --------------------------------------------------
-    if (!ignitionWasOn && ignitionNow) {
-      if (ignitionOffQualified && allSafe) {
+  // --------------------------------------------------
+  // EXECUTE RESET ON RISING EDGE OF IGNITION
+  // --------------------------------------------------
+  if (!ignitionWasOn && ignitionNow) {
+    if (ignitionOffQualified && allSafe) {
 #if DEBUG_SERIAL
-        Serial.println(F("[FAULT] RESET VIA IGNITION TOGGLE"));
+      Serial.println(F("[FAULT] RESET VIA IGNITION TOGGLE"));
 #endif
 
-        faultLatched = false;
-        activeFault = FaultCode::NONE;
+      faultLatched = false;
+      activeFault = FaultCode::NONE;
 
-        systemState = SystemState::INIT;
-        driveState = DriveState::IDLE;
-        bladeState = BladeState::IDLE;
-        forceSafetyState(SafetyState::SAFE);
-      }
-
-      ignitionOffQualified = false;
-      ignitionOffStart_ms = 0;
+      systemState = SystemState::INIT;
+      driveState = DriveState::IDLE;
+      bladeState = BladeState::IDLE;
+      forceSafetyState(SafetyState::SAFE);
     }
 
-    ignitionWasOn = ignitionNow;
+    ignitionOffQualified = false;
+    ignitionOffStart_ms = 0;
   }
 
-  // ============================================================================
-  // SETUP  (FIXED / FIELD-SAFE)
-  // ============================================================================
-  void setup() {
+  ignitionWasOn = ignitionNow;
+}
+
+// ============================================================================
+// SETUP  (FIXED / FIELD-SAFE)
+// ============================================================================
+void setup() {
 
 // --------------------------------------------------
 // SERIAL (DEBUG)
 // --------------------------------------------------
 #if DEBUG_SERIAL || TELEMETRY_CSV
-    Serial.begin(115200);
+  Serial.begin(115200);
 #endif
-    // --------------------------------------------------
-    // SERIAL COMMUNICATION
-    // --------------------------------------------------
-    Serial1.begin(115200);  // iBUS
-    Serial2.begin(115200);  // Storm32
+  // --------------------------------------------------
+  // SERIAL COMMUNICATION
+  // --------------------------------------------------
+  Serial1.begin(115200);  // iBUS
+  Serial2.begin(115200);  // Storm32
 
-    ibus.begin(Serial1);  // iBUS = INPUT ONLY
-    gimbal.begin();       // Storm32 uses Serial2
+  ibus.begin(Serial1);  // iBUS = INPUT ONLY
+  gimbal.begin();       // Storm32 uses Serial2
 
-    gimbal.forceOff();  // <<< HARD LOCK gimbal at boot
+  gimbal.forceOff();  // <<< HARD LOCK gimbal at boot
 
-    // --------------------------------------------------
-    // I2C
-    // --------------------------------------------------
-    i2cBusClear();
-    Wire.begin();
-    Wire.setClock(100000);
-    Wire.setWireTimeout(6000, true);
+  // --------------------------------------------------
+  // I2C
+  // --------------------------------------------------
+  i2cBusClear();
+  Wire.begin();
+  Wire.setClock(100000);
+  Wire.setWireTimeout(6000, true);
 
-    // --------------------------------------------------
-    // ADS1115 DETECT (ROBUST INIT)
-    // --------------------------------------------------
+  // --------------------------------------------------
+  // ADS1115 DETECT (ROBUST INIT)
+  // --------------------------------------------------
 
-    adsCurPresent = adsCur.begin(0x48);
-    if (adsCurPresent) {
-      adsCur.setGain(GAIN_ONE);
-      adsCur.setDataRate(RATE_ADS1115_250SPS);
+  adsCurPresent = adsCur.begin(0x48);
+  if (adsCurPresent) {
+    adsCur.setGain(GAIN_ONE);
+    adsCur.setDataRate(RATE_ADS1115_250SPS);
 #if DEBUG_SERIAL
-      Serial.println(F("[BOOT] ADS CUR OK (0x48)"));
+    Serial.println(F("[BOOT] ADS CUR OK (0x48)"));
 #endif
-    } else {
+  } else {
 #if DEBUG_SERIAL
-      Serial.println(F("[BOOT] ADS CUR NOT FOUND (0x48)"));
+    Serial.println(F("[BOOT] ADS CUR NOT FOUND (0x48)"));
 #endif
-    }
+  }
 
-    adsVoltPresent = adsVolt.begin(0x49);
-    if (adsVoltPresent) {
-      adsVolt.setGain(GAIN_ONE);
-      adsVolt.setDataRate(RATE_ADS1115_250SPS);
+  adsVoltPresent = adsVolt.begin(0x49);
+  if (adsVoltPresent) {
+    adsVolt.setGain(GAIN_ONE);
+    adsVolt.setDataRate(RATE_ADS1115_250SPS);
 #if DEBUG_SERIAL
-      Serial.println(F("[BOOT] ADS VOLT OK (0x49)"));
+    Serial.println(F("[BOOT] ADS VOLT OK (0x49)"));
 #endif
-    } else {
+  } else {
 #if DEBUG_SERIAL
-      Serial.println(F("[BOOT] ADS VOLT NOT FOUND (0x49)"));
+    Serial.println(F("[BOOT] ADS VOLT NOT FOUND (0x49)"));
 #endif
-    }
+  }
 
-    // --------------------------------------------------
-    // READ LAST FAULT FROM EEPROM (FAULT HISTORY)
-    // --------------------------------------------------
-    uint8_t raw;
-    EEPROM.get(100, raw);
+  // --------------------------------------------------
+  // READ LAST FAULT FROM EEPROM (FAULT HISTORY)
+  // --------------------------------------------------
+  uint8_t raw;
+  EEPROM.get(100, raw);
 
-    if (!isValidEnum<FaultCode>(raw)) {
-      raw = 0;  // หรือ FaultCode::NONE
-    }
+  if (!isValidEnum<FaultCode>(raw)) {
+    raw = 0;  // หรือ FaultCode::NONE
+  }
 
-    FaultCode lastFault = static_cast<FaultCode>(raw);
+  FaultCode lastFault = static_cast<FaultCode>(raw);
 
 #if DEBUG_SERIAL
-    Serial.print(F("[BOOT] LAST FAULT = "));
-    Serial.println((uint8_t)lastFault);
+  Serial.print(F("[BOOT] LAST FAULT = "));
+  Serial.println((uint8_t)lastFault);
 #endif
 
 #if TEST_MODE && DEBUG_SERIAL
-    Serial.println();
-    Serial.println(F("==================================="));
-    Serial.println(F("!!! TEST MODE ACTIVE !!!"));
-    Serial.println(F("NO REAL SENSORS / BENCH TEST ONLY"));
-    Serial.println(F("DO NOT USE IN FIELD OPERATION"));
-    Serial.println(F("==================================="));
+  Serial.println();
+  Serial.println(F("==================================="));
+  Serial.println(F("!!! TEST MODE ACTIVE !!!"));
+  Serial.println(F("NO REAL SENSORS / BENCH TEST ONLY"));
+  Serial.println(F("DO NOT USE IN FIELD OPERATION"));
+  Serial.println(F("==================================="));
 #endif
 
-    // --------------------------------------------------
-    // GPIO OUTPUT
-    // --------------------------------------------------
-    pinMode(PIN_HW_WD_HB, OUTPUT);
-    digitalWrite(PIN_HW_WD_HB, LOW);  // ค่าเริ่มต้น = silent
+  // --------------------------------------------------
+  // GPIO OUTPUT
+  // --------------------------------------------------
+  pinMode(PIN_HW_WD_HB, OUTPUT);
+  digitalWrite(PIN_HW_WD_HB, LOW);  // ค่าเริ่มต้น = silent
 
-    pinMode(PIN_DRV_ENABLE, OUTPUT);
-    digitalWrite(PIN_DRV_ENABLE, LOW);  // ❗ default = disable driver
-    pinMode(DIR_L1, OUTPUT);
-    pinMode(DIR_L2, OUTPUT);
-    pinMode(DIR_R1, OUTPUT);
-    pinMode(DIR_R2, OUTPUT);
+  pinMode(PIN_DRV_ENABLE, OUTPUT);
+  digitalWrite(PIN_DRV_ENABLE, LOW);  // ❗ default = disable driver
+  pinMode(DIR_L1, OUTPUT);
+  pinMode(DIR_L2, OUTPUT);
+  pinMode(DIR_R1, OUTPUT);
+  pinMode(DIR_R2, OUTPUT);
 
-    pinMode(MAX_CS_L, OUTPUT);
-    pinMode(MAX_CS_R, OUTPUT);
-    digitalWrite(MAX_CS_L, HIGH);
-    digitalWrite(MAX_CS_R, HIGH);
-    pinMode(PIN_CUR_TRIP, INPUT_PULLUP);
+  pinMode(MAX_CS_L, OUTPUT);
+  pinMode(MAX_CS_R, OUTPUT);
+  digitalWrite(MAX_CS_L, HIGH);
+  digitalWrite(MAX_CS_R, HIGH);
+  pinMode(PIN_CUR_TRIP, INPUT_PULLUP);
 
-    pinMode(PIN_BUZZER, OUTPUT);
-    digitalWrite(PIN_BUZZER, LOW);
-    pinMode(RELAY_WARN, OUTPUT);
-    digitalWrite(RELAY_WARN, LOW);
-    pinMode(RELAY_STARTER, OUTPUT);
-    digitalWrite(RELAY_STARTER, LOW);
-    pinMode(RELAY_IGNITION, OUTPUT);
-    digitalWrite(RELAY_IGNITION, LOW);
-    pinMode(FAN_L, OUTPUT);
-    digitalWrite(FAN_L, LOW);
-    pinMode(FAN_R, OUTPUT);
-    digitalWrite(FAN_R, LOW);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(RELAY_WARN, OUTPUT);
+  digitalWrite(RELAY_WARN, LOW);
+  pinMode(RELAY_STARTER, OUTPUT);
+  digitalWrite(RELAY_STARTER, LOW);
+  pinMode(RELAY_IGNITION, OUTPUT);
+  digitalWrite(RELAY_IGNITION, LOW);
+  pinMode(FAN_L, OUTPUT);
+  digitalWrite(FAN_L, LOW);
+  pinMode(FAN_R, OUTPUT);
+  digitalWrite(FAN_R, LOW);
 
-    driveSafe();  // <<< HARD motor cut at boot
+  driveSafe();  // <<< HARD motor cut at boot
 
-    // --------------------------------------------------
-    // SPI / TEMPERATURE
-    // --------------------------------------------------
-    // SPI / TEMPERATURE
+  // --------------------------------------------------
+  // SPI / TEMPERATURE
+  // --------------------------------------------------
+  // SPI / TEMPERATURE
 #if !TEST_MODE
-    SPI.begin();
-    maxL.begin(MAX31865_3WIRE);
-    maxR.begin(MAX31865_3WIRE);
+  SPI.begin();
+  maxL.begin(MAX31865_3WIRE);
+  maxR.begin(MAX31865_3WIRE);
 #else
 #if DEBUG_SERIAL
-    Serial.println(F("[BOOT] TEST MODE - PT100 DISABLED"));
+  Serial.println(F("[BOOT] TEST MODE - PT100 DISABLED"));
 #endif
 #endif
 
-    // --------------------------------------------------
-    // PWM / SERVO
-    // --------------------------------------------------
-    driveSafe();
-    setPWM_L(0);
-    setPWM_R(0);
-    setupPWM15K();
-    setupFanPWM15K();
+  // --------------------------------------------------
+  // PWM / SERVO
+  // --------------------------------------------------
+  driveSafe();
+  setPWM_L(0);
+  setPWM_R(0);
+  setupPWM15K();
+  setupFanPWM15K();
 
-    bladeServo.attach(SERVO_ENGINE_PIN);
-    bladeServo.writeMicroseconds(1000);
+  bladeServo.attach(SERVO_ENGINE_PIN);
+  bladeServo.writeMicroseconds(1000);
 
-    // --------------------------------------------------
-    // INIT SENSOR / STATE
-    // --------------------------------------------------
-    for (uint8_t i = 0; i < 4; i++) {
-      curA[i] = 0.0f;
-      overCurCnt[i] = 0;
-    }
-
-    tempDriverL = 0;
-    tempDriverR = 0;
-    engineVolt = 0.0f;
-
-    systemState = SystemState::INIT;
-    if (!isValidEnum<SystemState>(static_cast<uint8_t>(systemState))) {
-      systemState = SystemState::FAULT;
-    }
-    driveState = DriveState::IDLE;
-    bladeState = BladeState::IDLE;
-
-    faultLatched = false;
-    activeFault = FaultCode::NONE;
-
-    curL = curR = 0;
-    targetL = targetR = 0;
-
-    revBlockUntilL = 0;
-    revBlockUntilR = 0;
-
-    driveSoftStopStart_ms = 0;
-    bladeSoftStopStart_ms = 0;
-
-    // --------------------------------------------------
-    // MISSING RUNTIME RESET (CRITICAL)
-    // --------------------------------------------------
-    engineStopped_ms = 0;
-    starterActive = false;
-
-    lastIbusByte_ms = millis();
-    ibusCommLost = true;
-
-    // --------------------------------------------------
-    // INIT WATCHDOG DOMAINS (CRITICAL: PREVENT BOOT FALSE TRIP)
-    // --------------------------------------------------
-    {
-      uint32_t now = millis();
-
-      wdSensor.lastUpdate_ms = now;
-      wdComms.lastUpdate_ms = now;
-      wdDrive.lastUpdate_ms = now;
-      wdBlade.lastUpdate_ms = now;
-
-      wdSensor.faulted = false;
-      wdComms.faulted = false;
-      wdDrive.faulted = false;
-      wdBlade.faulted = false;
-    }
-    // --------------------------------------------------
-    // HW WATCHDOG (LAST)
-    // --------------------------------------------------
-    wdt_reset();
-    wdt_enable(WDTO_1S);
-    MCUSR &= ~(1 << WDRF);
-    wdt_enable(WDTO_1S);
+  // --------------------------------------------------
+  // INIT SENSOR / STATE
+  // --------------------------------------------------
+  for (uint8_t i = 0; i < 4; i++) {
+    curA[i] = 0.0f;
+    overCurCnt[i] = 0;
   }
 
-  void loop() {
+  tempDriverL = 0;
+  tempDriverR = 0;
+  engineVolt = 0.0f;
 
+  systemState = SystemState::INIT;
+  if (!isValidEnum<SystemState>(static_cast<uint8_t>(systemState))) {
+    systemState = SystemState::FAULT;
+  }
+  driveState = DriveState::IDLE;
+  bladeState = BladeState::IDLE;
+
+  faultLatched = false;
+  activeFault = FaultCode::NONE;
+
+  curL = curR = 0;
+  targetL = targetR = 0;
+
+  revBlockUntilL = 0;
+  revBlockUntilR = 0;
+
+  driveSoftStopStart_ms = 0;
+  bladeSoftStopStart_ms = 0;
+
+  // --------------------------------------------------
+  // MISSING RUNTIME RESET (CRITICAL)
+  // --------------------------------------------------
+  engineStopped_ms = 0;
+  starterActive = false;
+
+  lastIbusByte_ms = millis();
+  ibusCommLost = true;
+
+  // --------------------------------------------------
+  // INIT WATCHDOG DOMAINS (CRITICAL: PREVENT BOOT FALSE TRIP)
+  // --------------------------------------------------
+  {
     uint32_t now = millis();
-    uint32_t loopStart_us = micros();
+
+    wdSensor.lastUpdate_ms = now;
+    wdComms.lastUpdate_ms = now;
+    wdDrive.lastUpdate_ms = now;
+    wdBlade.lastUpdate_ms = now;
+
+    wdSensor.faulted = false;
+    wdComms.faulted = false;
+    wdDrive.faulted = false;
+    wdBlade.faulted = false;
+  }
+  // --------------------------------------------------
+  // HW WATCHDOG (LAST)
+  // --------------------------------------------------
+  wdt_reset();
+  wdt_enable(WDTO_1S);
+  MCUSR &= ~(1 << WDRF);
+  wdt_enable(WDTO_1S);
+}
+
+void loop() {
+
+  uint32_t now = millis();
+  uint32_t loopStart_us = micros();
 
 #if DEBUG_SERIAL && !TELEMETRY_CSV
-    debugTestMode(now);
-    debugTelemetry(now);
-    debugIBus(now);
+  debugTestMode(now);
+  debugTelemetry(now);
+  debugIBus(now);
 #endif
 
-    // ==================================================
-    // PHASE 1 : COMMS
-    // ==================================================
-    uint32_t tComms_us = micros();
+  // ==================================================
+  // PHASE 1 : COMMS
+  // ==================================================
+  uint32_t tComms_us = micros();
 
-    updateComms(now);
-    updateIgnition();
-    updateSystemState(now);
+  updateComms(now);
+  updateIgnition();
+  updateSystemState(now);
 
-    uint32_t dtComms = micros() - tComms_us;
+  uint32_t dtComms = micros() - tComms_us;
 
-    if (dtComms > BUDGET_COMMS_MS * 1000UL) {
+  if (dtComms > BUDGET_COMMS_MS * 1000UL) {
 
-      if (++commsBudgetCnt >= PHASE_BUDGET_CONFIRM)
-        latchFault(FaultCode::COMMS_TIMEOUT);
+    if (++commsBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::COMMS_TIMEOUT);
 
-    } else {
+  } else {
 
-      commsBudgetCnt = 0;
-    }
+    commsBudgetCnt = 0;
+  }
 
-    // ==================================================
-    // PHASE 2 : SENSORS
-    // ==================================================
-    uint32_t tSensor_us = micros();
+  // ==================================================
+  // PHASE 2 : SENSORS
+  // ==================================================
+  uint32_t tSensor_us = micros();
 
-    bool sensorAlive = updateSensors();
+  bool sensorAlive = updateSensors();
 
-    uint32_t dtSensor = micros() - tSensor_us;
+  uint32_t dtSensor = micros() - tSensor_us;
 
-    static uint8_t sensorBudgetCnt = 0;
+  static uint8_t sensorBudgetCnt = 0;
 
-    if (dtSensor > BUDGET_SENSORS_MS * 1000UL) {
+  if (dtSensor > BUDGET_SENSORS_MS * 1000UL) {
 
-      if (++sensorBudgetCnt >= PHASE_BUDGET_CONFIRM)
-        latchFault(FaultCode::SENSOR_TIMEOUT);
+    if (++sensorBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::SENSOR_TIMEOUT);
 
-    } else {
+  } else {
 
-      sensorBudgetCnt = 0;
+    sensorBudgetCnt = 0;
 
-      if (sensorAlive)
-        wdSensor.lastUpdate_ms = now;
-    }
+    if (sensorAlive)
+      wdSensor.lastUpdate_ms = now;
+  }
 
-    // ==================================================
-    // DRIVE EVENT LAYER
-    // ==================================================
-    memcpy(curA_snapshot, curA, sizeof(curA));
-    lastDriveEvent = DriveEvent::NONE;
+  // ==================================================
+  // DRIVE EVENT LAYER
+  // ==================================================
+  memcpy(curA_snapshot, curA, sizeof(curA));
+  lastDriveEvent = DriveEvent::NONE;
 
-    updateEngineState(now);
+  updateEngineState(now);
 
-    // --------------------------------------------------
-    // IDLE CURRENT OFFSET AUTO RECALIBRATION
-    // --------------------------------------------------
-    idleCurrentAutoRezero(now);
+  // --------------------------------------------------
+  // IDLE CURRENT OFFSET AUTO RECALIBRATION
+  // --------------------------------------------------
+  idleCurrentAutoRezero(now);
 
-    detectSideImbalanceAndSteer();
-    detectWheelStuck(now);
-    detectWheelLock();
+  detectSideImbalanceAndSteer();
+  detectWheelStuck(now);
+  detectWheelLock();
 
-    if (detectMotorStall())
-      lastDriveEvent = DriveEvent::WHEEL_LOCK;
+  if (detectMotorStall())
+    lastDriveEvent = DriveEvent::WHEEL_LOCK;
 
-    // ==================================================
-    // SAFETY MANAGER
-    // ==================================================
-    SafetyInput sin;
+  // ==================================================
+  // SAFETY MANAGER
+  // ==================================================
+  SafetyInput sin;
 
-    memcpy(sin.curA, curA, sizeof(curA));
+  memcpy(sin.curA, curA, sizeof(curA));
 
-    sin.tempDriverL = tempDriverL;
-    sin.tempDriverR = tempDriverR;
-    sin.faultLatched = faultLatched;
-    sin.driveEvent = lastDriveEvent;
+  sin.tempDriverL = tempDriverL;
+  sin.tempDriverR = tempDriverR;
+  sin.faultLatched = faultLatched;
+  sin.driveEvent = lastDriveEvent;
 
-    SafetyThresholds sth = {
-      CUR_WARN_A,
-      CUR_LIMP_A,
-      TEMP_WARN_C,
-      TEMP_LIMP_C
-    };
+  SafetyThresholds sth = {
+    CUR_WARN_A,
+    CUR_LIMP_A,
+    TEMP_WARN_C,
+    TEMP_LIMP_C
+  };
 
-    SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
+  SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
 
-    updateSafetyStability(
-      rawSafety,
-      now,
-      autoReverseCount,
-      autoReverseActive,
-      lastDriveEvent);
+  updateSafetyStability(
+    rawSafety,
+    now,
+    autoReverseCount,
+    autoReverseActive,
+    lastDriveEvent);
 
-    if (faultLatched)
-      systemState = SystemState::FAULT;
+  if (faultLatched)
+    systemState = SystemState::FAULT;
 
-    processFaultReset(now);
+  processFaultReset(now);
 
-    bool emergencyActive =
-      (systemState == SystemState::FAULT) || (getDriveSafety() == SafetyState::EMERGENCY);
+  bool emergencyActive =
+    (systemState == SystemState::FAULT) || (getDriveSafety() == SafetyState::EMERGENCY);
 
-    // ==================================================
-    // SYSTEM GATE
-    // ==================================================
-    if (systemState != SystemState::ACTIVE || emergencyActive) {
+  // ==================================================
+  // SYSTEM GATE
+  // ==================================================
+  if (systemState != SystemState::ACTIVE || emergencyActive) {
 
-      handleFaultImmediateCut();
+    handleFaultImmediateCut();
 
-      digitalWrite(PIN_DRV_ENABLE, LOW);
+    digitalWrite(PIN_DRV_ENABLE, LOW);
 
-      backgroundFaultEEPROMTask(now);
-      monitorSubsystemWatchdogs(now);
-
-#if TELEMETRY_CSV
-      telemetryCSV(now, loopStart_us);
-#endif
-
-      digitalWrite(PIN_HW_WD_HB,
-                   !digitalRead(PIN_HW_WD_HB));
-
-      return;
-    }
-
-    // ==================================================
-    // PHASE 3 : DRIVE
-    // ==================================================
-    uint32_t tDrive_us = micros();
-
-    runDrive(now);
-
-    uint32_t tApply_us = micros();
-    applyDrive();
-    uint32_t dtApply = micros() - tApply_us;
-
-    // applyDrive watchdog guard
-    if (dtApply > BUDGET_DRIVE_MS * 1000UL) {
-
-      if (++driveBudgetCnt >= PHASE_BUDGET_CONFIRM)
-        latchFault(FaultCode::DRIVE_TIMEOUT);
-
-    } else {
-
-      driveBudgetCnt = 0;
-    }
-
-    // feed watchdog AFTER applyDrive
-    wdDrive.lastUpdate_ms = now;
-
-    // ==================================================
-    // PHASE 3B : BLADE
-    // ==================================================
-    uint32_t tBlade_us = micros();
-
-    runBlade(now);
-
-    uint32_t dtBlade = micros() - tBlade_us;
-
-    if (dtBlade > BUDGET_BLADE_MS * 1000UL) {
-
-      if (++bladeBudgetCnt >= PHASE_BUDGET_CONFIRM)
-        latchFault(FaultCode::BLADE_TIMEOUT);
-
-    } else {
-
-      bladeBudgetCnt = 0;
-      wdBlade.lastUpdate_ms = now;
-    }
-
-    // ==================================================
-    // PHASE 4 : AUX
-    // ==================================================
-    updateVoltageWarning(now);
-    updateDriverFans();
-    updateEngineThrottle();
-    updateStarter(now);
-
-    gimbal.setSystemEnabled(
-      systemState == SystemState::ACTIVE && !emergencyActive && !requireIbusConfirm);
-
-    gimbal.update(now);
-
-    // ==================================================
-    // BACKGROUND TASKS
-    // ==================================================
-    monitorSubsystemWatchdogs(now);
     backgroundFaultEEPROMTask(now);
-
-    // ==================================================
-    // INDUSTRIAL LOOP TIMING SUPERVISOR
-    // ==================================================
-    {
-      uint32_t loopTime_us = micros() - loopStart_us;
-      uint32_t loopBudget_us = BUDGET_LOOP_MS * 1000UL;
-
-      if (loopTime_us > LOOP_HARD_LIMIT_US)
-        latchFault(FaultCode::LOOP_OVERRUN);
-
-      if (loopTime_us > loopBudget_us)
-        loopOverrunAccum_us += (loopTime_us - loopBudget_us);
-      else {
-        loopOverrunAccum_us -= LOOP_OVERRUN_RECOVER_US;
-        if (loopOverrunAccum_us < 0)
-          loopOverrunAccum_us = 0;
-      }
-
-      if (loopOverrunAccum_us > LOOP_OVERRUN_FAULT_US)
-        latchFault(FaultCode::LOOP_OVERRUN);
-    }
-
-    // ==================================================
-    // DRIVER ENABLE CONTROL (SPIKE SAFE)
-    // ==================================================
-
-    static uint32_t driveEnableArmStart_ms = 0;
-    static uint32_t driverEnabled_ms = 0;
-
-    static bool driverEnabled = false;
-    static bool driverSettling = false;
-
-    bool runAllowed =
-      (driveState == DriveState::RUN || driveState == DriveState::LIMP);
-
-    bool hardCut =
-      emergencyActive || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
-
-    bool pwmSafe =
-      (abs(curL) < 20) && (abs(curR) < 20);
-
-    bool thrNeutral =
-      neutral(ibus.readChannel(CH_THROTTLE));
-
-    bool strNeutral =
-      neutral(ibus.readChannel(CH_STEER));
-
-    bool rcSafe = thrNeutral && strNeutral;
-
-    // --------------------------------------------------
-    // TARGET STABILITY GUARD
-    // ต้องนิ่งก่อน enable driver
-    // --------------------------------------------------
-
-    static uint32_t targetStableStart_ms = 0;
-
-    bool targetNowZero =
-      (targetL == 0) && (targetR == 0);
-
-    if (targetNowZero) {
-
-      if (targetStableStart_ms == 0)
-        targetStableStart_ms = now;
-
-    } else {
-
-      targetStableStart_ms = 0;
-    }
-
-    bool targetSafe =
-      (targetStableStart_ms != 0) && (now - targetStableStart_ms >= 50);
-
-    bool ibusConfirmed =
-      !requireIbusConfirm;
-
-    bool autoReverseInactive =
-      !autoReverseActive;
-
-    bool dirSafe =
-      digitalRead(DIR_L1) == LOW && digitalRead(DIR_L2) == LOW && digitalRead(DIR_R1) == LOW && digitalRead(DIR_R2) == LOW;
-
-    constexpr uint32_t DRIVER_ARM_MS = 80;
-    constexpr uint32_t DRIVER_SETTLE_MS = 40;
-
-    // ---------------- HARD CUT ----------------
-    if (hardCut) {
-
-      driveEnableArmStart_ms = 0;
-
-      driverEnabled = false;
-      driverSettling = false;
-
-      digitalWrite(PIN_DRV_ENABLE, LOW);
-    }
-
-    // ---------------- ARM DRIVER ----------------
-    else if (runAllowed && pwmSafe && rcSafe && targetSafe && ibusConfirmed && autoReverseInactive && dirSafe) {
-
-      if (driveEnableArmStart_ms == 0)
-        driveEnableArmStart_ms = now;
-
-      // --------------------------------------------------
-      // DRIVER ARM COMPLETE
-      // --------------------------------------------------
-      static uint32_t pwmZeroStart_ms = 0;
-
-      if (!driverEnabled && (now - driveEnableArmStart_ms >= DRIVER_ARM_MS)) {
-
-        // บังคับ PWM = 0 ก่อน
-        setPWM_L(0);
-        setPWM_R(0);
-
-        curL = 0;
-        curR = 0;
-
-        targetL = 0;
-        targetR = 0;
-
-        // เริ่มจับเวลา PWM zero hold
-        if (pwmZeroStart_ms == 0)
-          pwmZeroStart_ms = now;
-
-        // รอ PWM settle
-        if (now - pwmZeroStart_ms >= 5) {
-
-          digitalWrite(PIN_DRV_ENABLE, HIGH);
-
-          driverEnabled = true;
-          driverSettling = true;
-
-          driverEnabled_ms = now;
-
-          pwmZeroStart_ms = 0;
-        }
-      }
-    }
-
-    // ---------------- CONDITIONS NOT SAFE ----------------
-    else {
-
-      driveEnableArmStart_ms = 0;
-
-      driverEnabled = false;
-      driverSettling = false;
-
-      digitalWrite(PIN_DRV_ENABLE, LOW);
-    }
-
-    // ---------------- DRIVER SETTLE WINDOW ----------------
-    if (driverSettling) {
-
-      if (now - driverEnabled_ms < DRIVER_SETTLE_MS) {
-
-        curL = 0;
-        curR = 0;
-
-        targetL = 0;
-        targetR = 0;
-
-      } else {
-
-        driverSettling = false;
-      }
-    }
+    monitorSubsystemWatchdogs(now);
 
 #if TELEMETRY_CSV
     telemetryCSV(now, loopStart_us);
 #endif
 
-    // ==================================================
-    // WATCHDOG FEED (PROGRESS SAFE + RAM GUARD)
-    // ==================================================
+    digitalWrite(PIN_HW_WD_HB,
+                 !digitalRead(PIN_HW_WD_HB));
 
-    static uint32_t lastLoopProgress_ms = 0;
+    return;
+  }
 
-    // --------------------------------------------------
-    // RAM GUARD (CRITICAL FOR MEGA2560)
-    // --------------------------------------------------
-    int freeMem = freeRam();
+  // ==================================================
+  // PHASE 3 : DRIVE
+  // ==================================================
+  uint32_t tDrive_us = micros();
 
-    if (freeMem < 600) {
+  runDrive(now);
 
-#if DEBUG_SERIAL
-      Serial.print(F("[RAM] LOW MEMORY: "));
-      Serial.println(freeMem);
-#endif
+  uint32_t tApply_us = micros();
+  applyDrive();
+  uint32_t dtApply = micros() - tApply_us;
 
-      latchFault(FaultCode::LOGIC_WATCHDOG);
+  // applyDrive watchdog guard
+  if (dtApply > BUDGET_DRIVE_MS * 1000UL) {
+
+    if (++driveBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::DRIVE_TIMEOUT);
+
+  } else {
+
+    driveBudgetCnt = 0;
+  }
+
+  // feed watchdog AFTER applyDrive
+  wdDrive.lastUpdate_ms = now;
+
+  // ==================================================
+  // PHASE 3B : BLADE
+  // ==================================================
+  uint32_t tBlade_us = micros();
+
+  runBlade(now);
+
+  uint32_t dtBlade = micros() - tBlade_us;
+
+  if (dtBlade > BUDGET_BLADE_MS * 1000UL) {
+
+    if (++bladeBudgetCnt >= PHASE_BUDGET_CONFIRM)
+      latchFault(FaultCode::BLADE_TIMEOUT);
+
+  } else {
+
+    bladeBudgetCnt = 0;
+    wdBlade.lastUpdate_ms = now;
+  }
+
+  // ==================================================
+  // PHASE 4 : AUX
+  // ==================================================
+  updateVoltageWarning(now);
+  updateDriverFans();
+  updateEngineThrottle();
+  updateStarter(now);
+
+  gimbal.setSystemEnabled(
+    systemState == SystemState::ACTIVE && !emergencyActive && !requireIbusConfirm);
+
+  gimbal.update(now);
+
+  // ==================================================
+  // BACKGROUND TASKS
+  // ==================================================
+  monitorSubsystemWatchdogs(now);
+  backgroundFaultEEPROMTask(now);
+
+  // ==================================================
+  // INDUSTRIAL LOOP TIMING SUPERVISOR
+  // ==================================================
+  {
+    uint32_t loopTime_us = micros() - loopStart_us;
+    uint32_t loopBudget_us = BUDGET_LOOP_MS * 1000UL;
+
+    if (loopTime_us > LOOP_HARD_LIMIT_US)
+      latchFault(FaultCode::LOOP_OVERRUN);
+
+    if (loopTime_us > loopBudget_us)
+      loopOverrunAccum_us += (loopTime_us - loopBudget_us);
+    else {
+      loopOverrunAccum_us -= LOOP_OVERRUN_RECOVER_US;
+      if (loopOverrunAccum_us < 0)
+        loopOverrunAccum_us = 0;
     }
 
+    if (loopOverrunAccum_us > LOOP_OVERRUN_FAULT_US)
+      latchFault(FaultCode::LOOP_OVERRUN);
+  }
+
+  // ==================================================
+  // DRIVER ENABLE CONTROL (SPIKE SAFE)
+  // ==================================================
+
+  static uint32_t driveEnableArmStart_ms = 0;
+  static uint32_t driverEnabled_ms = 0;
+
+  static bool driverEnabled = false;
+  static bool driverSettling = false;
+
+  bool runAllowed =
+    (driveState == DriveState::RUN || driveState == DriveState::LIMP);
+
+  bool hardCut =
+    emergencyActive || (driveState == DriveState::SOFT_STOP) || (driveState == DriveState::LOCKED);
+
+  bool pwmSafe =
+    (abs(curL) < 20) && (abs(curR) < 20);
+
+  bool thrNeutral =
+    neutral(ibus.readChannel(CH_THROTTLE));
+
+  bool strNeutral =
+    neutral(ibus.readChannel(CH_STEER));
+
+  bool rcSafe = thrNeutral && strNeutral;
+
+  // --------------------------------------------------
+  // TARGET STABILITY GUARD
+  // ต้องนิ่งก่อน enable driver
+  // --------------------------------------------------
+
+  static uint32_t targetStableStart_ms = 0;
+
+  bool targetNowZero =
+    (targetL == 0) && (targetR == 0);
+
+  if (targetNowZero) {
+
+    if (targetStableStart_ms == 0)
+      targetStableStart_ms = now;
+
+  } else {
+
+    targetStableStart_ms = 0;
+  }
+
+  bool targetSafe =
+    (targetStableStart_ms != 0) && (now - targetStableStart_ms >= 50);
+
+  bool ibusConfirmed =
+    !requireIbusConfirm;
+
+  bool autoReverseInactive =
+    !autoReverseActive;
+
+  bool dirSafe =
+    digitalRead(DIR_L1) == LOW && digitalRead(DIR_L2) == LOW && digitalRead(DIR_R1) == LOW && digitalRead(DIR_R2) == LOW;
+
+  constexpr uint32_t DRIVER_ARM_MS = 80;
+  constexpr uint32_t DRIVER_SETTLE_MS = 40;
+
+  // ---------------- HARD CUT ----------------
+  if (hardCut) {
+
+    driveEnableArmStart_ms = 0;
+
+    driverEnabled = false;
+    driverSettling = false;
+
+    digitalWrite(PIN_DRV_ENABLE, LOW);
+  }
+
+  // ---------------- ARM DRIVER ----------------
+  else if (runAllowed && pwmSafe && rcSafe && targetSafe && ibusConfirmed && autoReverseInactive && dirSafe) {
+
+    if (driveEnableArmStart_ms == 0)
+      driveEnableArmStart_ms = now;
+
     // --------------------------------------------------
-    // WATCHDOG HEALTH CHECK
+    // DRIVER ARM COMPLETE
     // --------------------------------------------------
-    bool wdHealthy =
-      !wdSensor.faulted && !wdComms.faulted && !wdDrive.faulted && !wdBlade.faulted && !faultLatched;
+    static uint32_t pwmZeroStart_ms = 0;
 
-    // ตรวจว่า loop ยังเดินจริง
-    bool loopProgress =
-      (now - lastLoopProgress_ms < 200);
+    if (!driverEnabled && (now - driveEnableArmStart_ms >= DRIVER_ARM_MS)) {
 
-    if (wdHealthy && loopProgress) {
+      // บังคับ PWM = 0 ก่อน
+      setPWM_L(0);
+      setPWM_R(0);
 
-      wdt_reset();
+      curL = 0;
+      curR = 0;
 
-      digitalWrite(PIN_HW_WD_HB,
-                   !digitalRead(PIN_HW_WD_HB));
+      targetL = 0;
+      targetR = 0;
+
+      // เริ่มจับเวลา PWM zero hold
+      if (pwmZeroStart_ms == 0)
+        pwmZeroStart_ms = now;
+
+      // รอ PWM settle
+      if (now - pwmZeroStart_ms >= 5) {
+
+        digitalWrite(PIN_DRV_ENABLE, HIGH);
+
+        driverEnabled = true;
+        driverSettling = true;
+
+        driverEnabled_ms = now;
+
+        pwmZeroStart_ms = 0;
+      }
+    }
+  }
+
+  // ---------------- CONDITIONS NOT SAFE ----------------
+  else {
+
+    driveEnableArmStart_ms = 0;
+
+    driverEnabled = false;
+    driverSettling = false;
+
+    digitalWrite(PIN_DRV_ENABLE, LOW);
+  }
+
+  // ---------------- DRIVER SETTLE WINDOW ----------------
+  if (driverSettling) {
+
+    if (now - driverEnabled_ms < DRIVER_SETTLE_MS) {
+
+      curL = 0;
+      curR = 0;
+
+      targetL = 0;
+      targetR = 0;
 
     } else {
 
-      digitalWrite(PIN_HW_WD_HB, LOW);
+      driverSettling = false;
     }
-
-    // update loop progress marker
-    lastLoopProgress_ms = now;
   }
+
+#if TELEMETRY_CSV
+  telemetryCSV(now, loopStart_us);
+#endif
+
+  // ==================================================
+  // WATCHDOG FEED (PROGRESS SAFE + RAM GUARD)
+  // ==================================================
+
+  static uint32_t lastLoopProgress_ms = 0;
+
+  // --------------------------------------------------
+  // RAM GUARD (CRITICAL FOR MEGA2560)
+  // --------------------------------------------------
+  int freeMem = freeRam();
+
+  if (freeMem < 600) {
+
+#if DEBUG_SERIAL
+    Serial.print(F("[RAM] LOW MEMORY: "));
+    Serial.println(freeMem);
+#endif
+
+    latchFault(FaultCode::LOGIC_WATCHDOG);
+  }
+
+  // --------------------------------------------------
+  // WATCHDOG HEALTH CHECK
+  // --------------------------------------------------
+  bool wdHealthy =
+    !wdSensor.faulted && !wdComms.faulted && !wdDrive.faulted && !wdBlade.faulted && !faultLatched;
+
+  // ตรวจว่า loop ยังเดินจริง
+  bool loopProgress =
+    (now - lastLoopProgress_ms < 200);
+
+  if (wdHealthy && loopProgress) {
+
+    wdt_reset();
+
+    digitalWrite(PIN_HW_WD_HB,
+                 !digitalRead(PIN_HW_WD_HB));
+
+  } else {
+
+    digitalWrite(PIN_HW_WD_HB, LOW);
+  }
+
+  // update loop progress marker
+  lastLoopProgress_ms = now;
+}
