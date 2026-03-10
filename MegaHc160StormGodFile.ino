@@ -1152,9 +1152,25 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   if (now - lastTx < TELEMETRY_PERIOD_MS) return;
   lastTx = now;
 
-  // buffer สำหรับสร้าง CSV
-  char line[220];
   uint8_t chk = 0;
+
+  auto out = [&](const char* s) {
+    while (*s) {
+      chk ^= *s;
+      Serial.write(*s++);
+    }
+  };
+
+  auto outInt = [&](long v) {
+    char buf[16];
+    ltoa(v, buf, 10);
+    out(buf);
+  };
+
+  auto outChar = [&](char c) {
+    chk ^= c;
+    Serial.write(c);
+  };
 
   // ================= LOOP TIME =================
   uint32_t loopTime_us = micros() - loopStart_us;
@@ -1202,41 +1218,45 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   SafetyState rawSafety =
     evaluateSafetyRaw(sin, sth);
 
-  // ================= CSV BUILD =================
-  int n = snprintf(
-    line,
-    sizeof(line),
-    "%lu,%d,%d,%d.%d,%d.%d,%d,%d,%d.%d,%d.%d,%lu,%c,%c,%c,%c,%u,%d,%u,%u,%c,%c,%c",
-    now,
-    tempDriverL,
-    tempDriverR,
-    volt_x10 / 10, abs(volt_x10 % 10),
-    curMax_x10 / 10, abs(curMax_x10 % 10),
-    curL,
-    curR,
-    cpuLoad_x10 / 10, abs(cpuLoad_x10 % 10),
-    cpuMargin_x10 / 10, abs(cpuMargin_x10 % 10),
-    now - lastIbusByte_ms,
-    wdS,
-    wdC,
-    wdD,
-    wdB,
-    (uint8_t)activeFault,
-    freeRam(),
-    autoReverseCount,
-    (uint8_t)rawSafety,
-    adsCur,
-    adsVolt,
-    gimbalOn
-  );
+  // ================= CSV OUTPUT =================
+
+  outInt(now); outChar(',');
+
+  outInt(tempDriverL); outChar(',');
+  outInt(tempDriverR); outChar(',');
+
+  outInt(volt_x10 / 10); outChar('.');
+  outInt(abs(volt_x10 % 10)); outChar(',');
+
+  outInt(curMax_x10 / 10); outChar('.');
+  outInt(abs(curMax_x10 % 10)); outChar(',');
+
+  outInt(curL); outChar(',');
+  outInt(curR); outChar(',');
+
+  outInt(cpuLoad_x10 / 10); outChar('.');
+  outInt(abs(cpuLoad_x10 % 10)); outChar(',');
+
+  outInt(cpuMargin_x10 / 10); outChar('.');
+  outInt(abs(cpuMargin_x10 % 10)); outChar(',');
+
+  outInt(now - lastIbusByte_ms); outChar(',');
+
+  outChar(wdS); outChar(',');
+  outChar(wdC); outChar(',');
+  outChar(wdD); outChar(',');
+  outChar(wdB); outChar(',');
+
+  outInt((uint8_t)activeFault); outChar(',');
+  outInt(freeRam()); outChar(',');
+  outInt(autoReverseCount); outChar(',');
+  outInt((uint8_t)rawSafety); outChar(',');
+
+  outChar(adsCur); outChar(',');
+  outChar(adsVolt); outChar(',');
+  outChar(gimbalOn);
 
   // ================= CHECKSUM =================
-  for (int i = 0; i < n; i++) {
-    chk ^= line[i];
-  }
-
-  // ================= OUTPUT =================
-  Serial.print(line);
   Serial.print(',');
   Serial.println(chk);
 
