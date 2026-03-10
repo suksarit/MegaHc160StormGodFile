@@ -442,6 +442,24 @@ bool readDriverTempsPT100(int &tL, int &tR) {
 }
 
 // ============================================================================
+// MOTOR SHORT BRAKE
+// ใช้สำหรับหยุด inertia ก่อน reverse
+// ============================================================================
+void motorShortBrake() {
+
+  // ตัด PWM ก่อน
+  setPWM_L(0);
+  setPWM_R(0);
+
+  // short brake
+  digitalWrite(DIR_L1, HIGH);
+  digitalWrite(DIR_L2, HIGH);
+
+  digitalWrite(DIR_R1, HIGH);
+  digitalWrite(DIR_R2, HIGH);
+}
+
+// ============================================================================
 // UPDATE DRIVER COOLING FANS
 // ============================================================================
 void updateDriverFans(void) {
@@ -1135,6 +1153,15 @@ void updateDriveTarget() {
 
   uint16_t rawThr = ibus.readChannel(CH_THROTTLE);
   uint16_t rawStr = ibus.readChannel(CH_STEER);
+
+  // RC RATE LIMIT GUARD
+  constexpr int RC_MAX_STEP = 120;
+
+  if (abs((int)rawThr - (int)lastThr) > RC_MAX_STEP)
+    rawThr = lastThr;
+
+  if (abs((int)rawStr - (int)lastStr) > RC_MAX_STEP)
+    rawStr = lastStr;
 
   rawThr = constrain(rawThr, 1000, 2000);
   rawStr = constrain(rawStr, 1000, 2000);
@@ -2482,7 +2509,11 @@ void applyDrive() {
   // ==================================================
   // AUTO REVERSE
   // ==================================================
-  if (autoReverseActive && !ibusCommLost && !requireIbusConfirm && systemState == SystemState::ACTIVE && (abs(targetL) > 100 || abs(targetR) > 100)) {
+  if (autoReverseActive &&
+      !ibusCommLost &&
+      !requireIbusConfirm &&
+      systemState == SystemState::ACTIVE &&
+      (abs(targetL) > 100 || abs(targetR) > 100)) {
 
     if (now - autoReverseStart_ms < AUTO_REV_MS) {
 
@@ -2614,11 +2645,10 @@ void applyDrive() {
   }
 
   // ==================================================
-  // REVERSE BRAKE WINDOW (EDGE SAFE VERSION)
-  // ป้องกัน brake oscillation เมื่อ RC ค้าง reverse
+  // REVERSE SHORT BRAKE
   // ==================================================
-  static uint32_t regenBlockUntil = 0;
-  static bool reverseWindowActive = false;
+  static bool reverseBrakeActive = false;
+  static uint32_t reverseBrakeStart_ms = 0;
 
   static int8_t lastTargetSignL = 0;
   static int8_t lastTargetSignR = 0;
@@ -2626,59 +2656,46 @@ void applyDrive() {
   int8_t signL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
   int8_t signR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
 
-  // --------------------------------------------------
-  // Detect direction change (edge trigger)
-  // --------------------------------------------------
   bool reverseRequest =
-    (signL != 0 && signL != lastTargetSignL) || (signR != 0 && signR != lastTargetSignR);
+      ((signL != 0 && signL != lastTargetSignL) ||
+       (signR != 0 && signR != lastTargetSignR)) &&
+      (abs(curL) > 150 || abs(curR) > 150);
 
   lastTargetSignL = signL;
   lastTargetSignR = signR;
 
-  constexpr uint16_t REVERSE_BRAKE_MS = 180;
+  constexpr uint16_t REVERSE_BRAKE_MS = 40;
 
-  // --------------------------------------------------
-  // Start brake window only once per direction change
-  // --------------------------------------------------
-  if (reverseRequest && !reverseWindowActive) {
+  if (reverseRequest && !reverseBrakeActive) {
 
-    regenBlockUntil = now + REVERSE_BRAKE_MS;
-    reverseWindowActive = true;
+    reverseBrakeActive = true;
+    reverseBrakeStart_ms = now;
   }
 
-  // --------------------------------------------------
-  // Active brake window
-  // --------------------------------------------------
-  if (reverseWindowActive) {
+  if (reverseBrakeActive) {
 
-    if (now < regenBlockUntil) {
+    if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
 
-      // Cut torque during reverse braking window
-      finalTargetL = 0;
-      finalTargetR = 0;
-
-      digitalWrite(PIN_DRV_ENABLE, LOW);
+      motorShortBrake();
 
       curL = 0;
       curR = 0;
 
-    } else {
+      return;
+    }
+    else {
 
-      // Window finished
-      reverseWindowActive = false;
-      regenBlockUntil = 0;
+      reverseBrakeActive = false;
     }
   }
 
   // ==================================================
-  // ADAPTIVE RAMP CONTROL
+  // RAMP CONTROL
   // ==================================================
-  int16_t errL = abs(finalTargetL - curL);
-  int16_t errR = abs(finalTargetR - curR);
-
-  int16_t errMax = max(errL, errR);
-
   int16_t step;
+
+  int16_t errMax = max(abs(finalTargetL - curL),
+                       abs(finalTargetR - curR));
 
   if (driveState == DriveState::LIMP)
     step = 2;
@@ -2689,61 +2706,11 @@ void applyDrive() {
   else
     step = 6;
 
+  curL = ramp(curL, finalTargetL, step);
+  curR = ramp(curR, finalTargetR, step);
+
   // ==================================================
-  // DRIVER ENABLE + SETTLE WINDOW (SPIKE SAFE)
-  // ==================================================
-
-  static bool lastDriverEnabled = false;
-  static uint32_t driverEnableTime_ms = 0;
-
-  bool driverEnabled = digitalRead(PIN_DRV_ENABLE);
-
-  // --------------------------------------------------
-  // Detect driver enable edge
-  // --------------------------------------------------
-  if (driverEnabled && !lastDriverEnabled) {
-
-    driverEnableTime_ms = now;
-
-    // reset ramp state when driver just enabled
-    curL = 0;
-    curR = 0;
-  }
-
-  // --------------------------------------------------
-  // Driver disabled → force zero
-  // --------------------------------------------------
-  if (!driverEnabled) {
-
-    curL = 0;
-    curR = 0;
-
-    finalTargetL = 0;
-    finalTargetR = 0;
-  }
-
-  // --------------------------------------------------
-  // Driver settling window
-  // --------------------------------------------------
-  else if (now - driverEnableTime_ms < 40) {
-
-    // hold outputs during driver stabilization
-    curL = 0;
-    curR = 0;
-  }
-
-  // --------------------------------------------------
-  // Normal ramp control
-  // --------------------------------------------------
-  else {
-
-    curL = ramp(curL, finalTargetL, step);
-    curR = ramp(curR, finalTargetR, step);
-  }
-
-  lastDriverEnabled = driverEnabled;
-  // ==================================================
-  // SAFE DIR SWITCH (NON-BLOCKING DEADTIME)
+  // SAFE DIR SWITCH
   // ==================================================
   static int8_t lastDirL = 0;
   static int8_t lastDirR = 0;
@@ -2754,13 +2721,13 @@ void applyDrive() {
   static uint32_t dirSwitchStartL_us = 0;
   static uint32_t dirSwitchStartR_us = 0;
 
-  constexpr uint16_t DIR_DEADTIME_US = 12;
-  int8_t dirL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
-  int8_t dirR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
+  constexpr uint16_t DIR_DEADTIME_US = 80;
+
+  int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
+  int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
 
   uint32_t now_us = micros();
 
-  // LEFT
   if (dirL != lastDirL && !dirSwitchPendingL) {
 
     setPWM_L(0);
@@ -2777,7 +2744,6 @@ void applyDrive() {
     lastDirL = dirL;
   }
 
-  // RIGHT
   if (dirR != lastDirR && !dirSwitchPendingR) {
 
     setPWM_R(0);
@@ -2794,17 +2760,11 @@ void applyDrive() {
     lastDirR = dirR;
   }
 
-  // ==================================================
-  // OUTPUT PWM
-  // ==================================================
   uint16_t pwmL = abs(curL);
   uint16_t pwmR = abs(curR);
 
   if (dirSwitchPendingL) pwmL = 0;
   if (dirSwitchPendingR) pwmR = 0;
-
-  if (pwmL > PWM_TOP) pwmL = PWM_TOP;
-  if (pwmR > PWM_TOP) pwmR = PWM_TOP;
 
   setPWM_L(pwmL);
   setPWM_R(pwmR);
@@ -3406,6 +3366,13 @@ void setup() {
 
   revBlockUntilL = 0;
   revBlockUntilR = 0;
+  // ============================================================================
+  // REVERSE BRAKE STATE MACHINE
+  // ============================================================================
+  bool reverseBrakeActive = false;
+  uint32_t reverseBrakeStart_ms = 0;
+
+  constexpr uint16_t REVERSE_BRAKE_MS = 40;  // 30-50 ms recommended
   driveSoftStopStart_ms = 0;
   bladeSoftStopStart_ms = 0;
 
@@ -3794,4 +3761,3 @@ void loop() {
     digitalWrite(PIN_HW_WD_HB, LOW);
   }
 }
-
