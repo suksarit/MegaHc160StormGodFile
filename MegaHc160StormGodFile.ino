@@ -2955,36 +2955,37 @@ void applyDrive() {
   curR = ramp(curR, finalTargetR, step);
 
   // ==================================================
-  // SAFE DIR SWITCH (H-BRIDGE PROTECTION)
-  // ==================================================
+// SAFE DIR SWITCH (H-BRIDGE SHOOT-THROUGH PROTECTION)
+// ==================================================
 
-  static int8_t lastDirL = 0;
-  static int8_t lastDirR = 0;
+static int8_t lastDirL = 0;
+static int8_t lastDirR = 0;
 
-  static bool dirSwitchPendingL = false;
-  static bool dirSwitchPendingR = false;
+static bool dirSwitchPendingL = false;
+static bool dirSwitchPendingR = false;
 
-  static uint32_t dirSwitchStartL_us = 0;
-  static uint32_t dirSwitchStartR_us = 0;
+static uint32_t dirSwitchStartL_us = 0;
+static uint32_t dirSwitchStartR_us = 0;
 
-  // เพิ่ม dead-time ให้มากขึ้น
-  constexpr uint16_t DIR_DEADTIME_US = 1000;
+static uint32_t pwmResumeL_us = 0;
+static uint32_t pwmResumeR_us = 0;
 
-  int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
-  int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
+constexpr uint16_t DIR_DEADTIME_US = 1000;
+constexpr uint16_t PWM_RESUME_DELAY_US = 600;
 
-  uint32_t now_us = micros();
+int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
+int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
 
-  // --------------------------------------------------
-  // LEFT MOTOR DIR CHANGE
-  // --------------------------------------------------
+uint32_t now_us = micros();
 
-  if (dirL != lastDirL && !dirSwitchPendingL) {
+// --------------------------------------------------
+// LEFT MOTOR DIR CHANGE
+// --------------------------------------------------
 
-  // stop PWM before direction change
+if (dirL != lastDirL && !dirSwitchPendingL) {
+
   setPWM_L(0);
 
-  // set neutral direction
   digitalWrite(DIR_L1, LOW);
   digitalWrite(DIR_L2, LOW);
 
@@ -2992,20 +2993,23 @@ void applyDrive() {
   dirSwitchStartL_us = now_us;
 }
 
-  if (dirSwitchPendingL && now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
+if (dirSwitchPendingL &&
+    now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
 
-    digitalWrite(DIR_L1, dirL > 0);
-    digitalWrite(DIR_L2, dirL < 0);
+  digitalWrite(DIR_L1, dirL > 0);
+  digitalWrite(DIR_L2, dirL < 0);
 
-    dirSwitchPendingL = false;
-    lastDirL = dirL;
-  }
+  pwmResumeL_us = now_us;
 
-  // --------------------------------------------------
-  // RIGHT MOTOR DIR CHANGE
-  // --------------------------------------------------
+  dirSwitchPendingL = false;
+  lastDirL = dirL;
+}
 
- if (dirR != lastDirR && !dirSwitchPendingR) {
+// --------------------------------------------------
+// RIGHT MOTOR DIR CHANGE
+// --------------------------------------------------
+
+if (dirR != lastDirR && !dirSwitchPendingR) {
 
   setPWM_R(0);
 
@@ -3016,27 +3020,33 @@ void applyDrive() {
   dirSwitchStartR_us = now_us;
 }
 
-  if (dirSwitchPendingR && now_us - dirSwitchStartR_us >= DIR_DEADTIME_US) {
+if (dirSwitchPendingR &&
+    now_us - dirSwitchStartR_us >= DIR_DEADTIME_US) {
 
-    digitalWrite(DIR_R1, dirR > 0);
-    digitalWrite(DIR_R2, dirR < 0);
+  digitalWrite(DIR_R1, dirR > 0);
+  digitalWrite(DIR_R2, dirR < 0);
 
-    dirSwitchPendingR = false;
-    lastDirR = dirR;
-  }
+  pwmResumeR_us = now_us;
 
-  // --------------------------------------------------
-  // APPLY PWM
-  // --------------------------------------------------
+  dirSwitchPendingR = false;
+  lastDirR = dirR;
+}
 
-  uint16_t pwmL = abs(curL);
-  uint16_t pwmR = abs(curR);
+// --------------------------------------------------
+// APPLY PWM WITH RESUME DELAY
+// --------------------------------------------------
 
-  if (dirSwitchPendingL) pwmL = 0;
-  if (dirSwitchPendingR) pwmR = 0;
+uint16_t pwmL = abs(curL);
+uint16_t pwmR = abs(curR);
 
-  setPWM_L(pwmL);
-  setPWM_R(pwmR);
+if (micros() - pwmResumeL_us < PWM_RESUME_DELAY_US)
+  pwmL = 0;
+
+if (micros() - pwmResumeR_us < PWM_RESUME_DELAY_US)
+  pwmR = 0;
+
+setPWM_L(pwmL);
+setPWM_R(pwmR);
 }
 
 // ============================================================================
