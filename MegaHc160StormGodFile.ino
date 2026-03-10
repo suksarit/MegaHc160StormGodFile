@@ -11,9 +11,9 @@
 #define DBG(x)
 #define DBGL(x)
 #endif
-#define TELEMETRY_CSV 1         // 1=เปิด 0=ปิด : CSV telemetry
-#define TELEMETRY_PERIOD_MS 50  // 15 Hz (เหมาะกับ plot โหลดหนัก)
-#define TEST_MODE 0             // 1=ทดสอบ ไม่มีเซ็นเซฮร์ , 0=สนามจริง มีเซ็นเซอร์
+#define TELEMETRY_CSV 1  // 1=เปิด 0=ปิด : CSV telemetry
+#define TELEMETRY_PERIOD_MS 200
+#define TEST_MODE 0  // 1=ทดสอบ ไม่มีเซ็นเซฮร์ , 0=สนามจริง มีเซ็นเซอร์
 
 #include <IBusBM.h>
 #include <Servo.h>
@@ -219,6 +219,7 @@ uint32_t bladeSoftStopStart_ms = 0;
 // SENSOR RUNTIME VALUES
 // ============================================================================
 float curA[4] = { 0 };
+float curA_snapshot[4] = { 0 };
 int16_t tempDriverL = 0;
 int16_t tempDriverR = 0;
 
@@ -469,17 +470,22 @@ void updateDriverFans(void) {
 // CURRENT AGGREGATION HELPERS
 // ============================================================================
 inline float curLeft() {
-  return curA[0] + curA[1];  // L1 + L2
+  return curA_snapshot[0] + curA_snapshot[1];
 }
 
 inline float curRight() {
-  return curA[2] + curA[3];  // R1 + R2
+  return curA_snapshot[2] + curA_snapshot[3];
 }
 
 // ============================================================================
 // AUTO REVERSE (FIELD-SAFE VERSION)
 // ============================================================================
 void startAutoReverse(uint32_t now) {
+  // --------------------------------------------------
+  // SAFETY GUARD
+  // --------------------------------------------------
+  if (getDriveSafety() != SafetyState::SAFE)
+    return;
 
   // --------------------------------------------------
   // AUTO REVERSE WINDOW RESET
@@ -498,7 +504,15 @@ void startAutoReverse(uint32_t now) {
   // HARD GUARD
   // --------------------------------------------------
   if (autoReverseActive) return;
-  if (autoReverseCount >= MAX_AUTO_REVERSE) return;
+  if (autoReverseCount >= MAX_AUTO_REVERSE) {
+
+#if DEBUG_SERIAL
+    Serial.println(F("[AUTO REV] ESCALATE -> STUCK FAULT"));
+#endif
+
+    latchFault(FaultCode::OVER_CURRENT);
+    return;
+  }
 
   // --------------------------------------------------
   // COOLDOWN (CRITICAL FOR FIELD)
@@ -634,31 +648,48 @@ void detectSideImbalanceAndSteer() {
   }
 }
 
+// ============================================================================
+// WHEEL STUCK DETECTION (FIELD TUNED VERSION)
+// ตรวจจับล้อติด / ล้อจม โดยใช้ current imbalance + adaptive threshold
+// ============================================================================
+
 void detectWheelStuck(uint32_t now) {
 
-  // ==================================================
-  // CONFIG
-  // ==================================================
-  constexpr int16_t MIN_PWM_FOR_STUCK = 300;  // ต้องมีแรงขับจริง
-  constexpr int16_t TURNING_DIFF_MAX = 250;   // เกินนี้ถือว่าเลี้ยว
+  // --------------------------------------------------
+  // GLOBAL COOLDOWN กัน oscillation reverse
+  // --------------------------------------------------
+  static uint32_t lastStuckTrigger_ms = 0;
 
-  // ==================================================
-  // PWM magnitude
-  // ==================================================
+  constexpr uint32_t STUCK_COOLDOWN_MS = 1500;
+
+  if (now - lastStuckTrigger_ms < STUCK_COOLDOWN_MS)
+    return;
+
+  // --------------------------------------------------
+  // CONFIG
+  // --------------------------------------------------
+  constexpr int16_t MIN_PWM_FOR_STUCK = 300;
+  constexpr int16_t TURNING_DIFF_MAX = 250;
+
+  constexpr float CURRENT_HYST = 2.0f;  // กัน sensor jitter
+
+  // --------------------------------------------------
+  // ต้องมีแรงขับจริง
+  // --------------------------------------------------
   int16_t pwmMag = max(abs(curL), abs(curR));
 
   if (pwmMag < MIN_PWM_FOR_STUCK)
     return;
 
-  // ==================================================
+  // --------------------------------------------------
   // ห้ามอยู่ในช่วง turning
-  // ==================================================
+  // --------------------------------------------------
   if (abs(curL - curR) > TURNING_DIFF_MAX)
     return;
 
-  // ==================================================
+  // --------------------------------------------------
   // CURRENT
-  // ==================================================
+  // --------------------------------------------------
   float cL = curLeft();
   float cR = curRight();
 
@@ -668,9 +699,13 @@ void detectWheelStuck(uint32_t now) {
   if (maxCur < CUR_WARN_A)
     return;
 
-  // ==================================================
+  // ป้องกัน division error
+  if (maxCur <= 0.01f)
+    return;
+
+  // --------------------------------------------------
   // ADAPTIVE PERCENT THRESHOLD
-  // ==================================================
+  // --------------------------------------------------
   float percentThreshold;
 
   if (pwmMag < 400)
@@ -680,9 +715,9 @@ void detectWheelStuck(uint32_t now) {
   else
     percentThreshold = 0.55f;
 
-  // ==================================================
+  // --------------------------------------------------
   // GRASS DENSITY ESTIMATOR
-  // ==================================================
+  // --------------------------------------------------
   static float prevCur = 0;
   static float rippleAvg = 0;
 
@@ -697,15 +732,23 @@ void detectWheelStuck(uint32_t now) {
   if (rippleAvg > 6.0f)
     percentThreshold *= 1.25f;
 
-  // ==================================================
+  // --------------------------------------------------
+  // CURRENT FLOOR GUARD (กัน noise)
+  // --------------------------------------------------
+  constexpr float MIN_VALID_CURRENT = 5.0f;
+
+  if (maxCur < MIN_VALID_CURRENT)
+    return;
+
+  // --------------------------------------------------
   // DIFFERENCE
-  // ==================================================
+  // --------------------------------------------------
   float diff = fabs(cL - cR);
   float percentDiff = diff / maxCur;
 
-  // ==================================================
+  // --------------------------------------------------
   // DYNAMIC STUCK TIME
-  // ==================================================
+  // --------------------------------------------------
   uint32_t stuckTime;
 
   if (pwmMag < 400)
@@ -718,10 +761,10 @@ void detectWheelStuck(uint32_t now) {
   static uint32_t leftStart_ms = 0;
   static uint32_t rightStart_ms = 0;
 
-  // ==================================================
+  // --------------------------------------------------
   // LEFT STUCK
-  // ==================================================
-  if (cL > cR && percentDiff > percentThreshold && cL > CUR_LIMP_A) {
+  // --------------------------------------------------
+  if (cL > cR + CURRENT_HYST && percentDiff > percentThreshold && cL > CUR_LIMP_A) {
 
     if (leftStart_ms == 0)
       leftStart_ms = now;
@@ -732,18 +775,23 @@ void detectWheelStuck(uint32_t now) {
       rightStart_ms = 0;
 
       lastDriveEvent = DriveEvent::STUCK_LEFT;
+
+      lastStuckTrigger_ms = now;
+
       startAutoReverse(now);
+
       return;
     }
 
   } else {
+
     leftStart_ms = 0;
   }
 
-  // ==================================================
+  // --------------------------------------------------
   // RIGHT STUCK
-  // ==================================================
-  if (cR > cL && percentDiff > percentThreshold && cR > CUR_LIMP_A) {
+  // --------------------------------------------------
+  if (cR > cL + CURRENT_HYST && percentDiff > percentThreshold && cR > CUR_LIMP_A) {
 
     if (rightStart_ms == 0)
       rightStart_ms = now;
@@ -754,60 +802,62 @@ void detectWheelStuck(uint32_t now) {
       rightStart_ms = 0;
 
       lastDriveEvent = DriveEvent::STUCK_RIGHT;
+
+      lastStuckTrigger_ms = now;
+
       startAutoReverse(now);
+
       return;
     }
 
   } else {
+
     rightStart_ms = 0;
   }
 }
 
 bool detectMotorStall() {
 
-  // เก็บค่า current รอบก่อน
   static float prevCurL = 0;
   static float prevCurR = 0;
 
-  // debounce counter
   static uint8_t stallCnt = 0;
 
-  // อ่านกระแสรวมของแต่ละฝั่ง
   float cL = curLeft();
   float cR = curRight();
 
-  // คำนวณ delta current
+  if (abs(curL) < 200 && abs(curR) < 200)
+    return false;
+
+  if (cL < 5 && cR < 5)
+    return false;
+
   float dCurL = cL - prevCurL;
   float dCurR = cR - prevCurR;
 
-  // อัปเดต previous
-  prevCurL = cL;
-  prevCurR = cR;
-
-  // threshold
   constexpr float STALL_CURRENT_STEP = 18.0f;
   constexpr float STALL_CURRENT_MIN = 40.0f;
   constexpr uint8_t STALL_CONFIRM_CNT = 2;
 
-  // ต้องมีโหลดจริงก่อน
   if (cL > STALL_CURRENT_MIN || cR > STALL_CURRENT_MIN) {
 
     bool stallDetected = false;
 
-    // ตรวจล้อซ้าย
-    if (cL > STALL_CURRENT_MIN && dCurL > STALL_CURRENT_STEP) {
+    if (cL > STALL_CURRENT_MIN && dCurL > STALL_CURRENT_STEP)
       stallDetected = true;
-    }
 
-    // ตรวจล้อขวา
-    if (cR > STALL_CURRENT_MIN && dCurR > STALL_CURRENT_STEP) {
+    if (cR > STALL_CURRENT_MIN && dCurR > STALL_CURRENT_STEP)
       stallDetected = true;
-    }
 
     if (stallDetected) {
 
       if (++stallCnt >= STALL_CONFIRM_CNT) {
+
         stallCnt = 0;
+
+        prevCurL = cL;
+        prevCurR = cR;
+
         return true;
       }
 
@@ -820,6 +870,9 @@ bool detectMotorStall() {
 
     stallCnt = 0;
   }
+
+  prevCurL = cL;
+  prevCurR = cR;
 
   return false;
 }
@@ -914,34 +967,29 @@ void detectWheelLock() {
 }
 
 void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
-
 #if TELEMETRY_CSV
 
   static uint32_t lastTx = 0;
   if (now - lastTx < TELEMETRY_PERIOD_MS) return;
   lastTx = now;
 
-  // =====================================================
-  // LOOP TIMING
-  // =====================================================
+  // ================= LOOP TIME =================
   uint32_t loopTime_us = micros() - loopStart_us;
-  float loopBudget_us = BUDGET_LOOP_MS * 1000.0f;
+  uint32_t loopBudget_us = BUDGET_LOOP_MS * 1000UL;
 
-  float cpuLoad = (loopTime_us / loopBudget_us) * 100.0f;
-  if (cpuLoad > 999.0f) cpuLoad = 999.0f;
+  int cpuLoad_x10 = (loopTime_us * 1000UL) / loopBudget_us;
+  if (cpuLoad_x10 > 9990) cpuLoad_x10 = 9990;
 
-  float loopMargin = 100.0f - cpuLoad;
-  if (loopMargin < -999.0f) loopMargin = -999.0f;
+  int cpuMargin_x10 = 1000 - cpuLoad_x10;
 
-  // =====================================================
-  // CURRENT
-  // =====================================================
+  // ================= CURRENT =================
   float curMax = max(max(curA[0], curA[1]),
                      max(curA[2], curA[3]));
 
-  // =====================================================
-  // WATCHDOG STATUS
-  // =====================================================
+  int curMax_x10 = (int)(curMax * 10.0f);
+  int volt_x10 = (int)(engineVolt * 10.0f);
+
+  // ================= WATCHDOG =================
   char wdS = wdSensor.faulted ? 'X' : 'O';
   char wdC = wdComms.faulted ? 'X' : 'O';
   char wdD = wdDrive.faulted ? 'X' : 'O';
@@ -953,6 +1001,7 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   char gimbalOn =
     (systemState == SystemState::ACTIVE && !faultLatched && !requireIbusConfirm) ? '1' : '0';
 
+  // ================= SAFETY =================
   SafetyInput sin;
   memcpy(sin.curA, curA, sizeof(curA));
   sin.tempDriverL = tempDriverL;
@@ -967,58 +1016,63 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
     TEMP_LIMP_C
   };
 
-  SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
+  SafetyState rawSafety =
+    evaluateSafetyRaw(sin, sth);
 
-  // =====================================================
-  // MULTI-LINE FORMAT (อ่านง่าย)
-  // =====================================================
-  static char line[320];
-
-  // แปลง float เป็น int เพื่อเลี่ยง %f
-  int volt_x10 = (int)(engineVolt * 10.0f);
-  int curMax_x10 = (int)(curMax * 10.0f);
-  int cpuLoad_x10 = (int)(cpuLoad * 10.0f);
-  int cpuMargin_x10 = (int)(loopMargin * 10.0f);
-
-  snprintf(line, sizeof(line),
-           "==============================\n"
-           "TEMP L/R   : %3d / %3d C\n"
-           "VOLT (24V) : %3d.%01d V\n"
-           "CURRENT MAX: %3d.%01d A\n"
-           "PWM L/R    : %4d / %4d\n"
-           "CPU LOAD   : %3d.%01d %%\n"
-           "CPU MARGIN : %3d.%01d %%\n"
-           "IBUS AGE   : %4lu ms\n"
-           "WATCHDOG   : S:%c C:%c D:%c B:%c\n"
-           "FAULT CODE : %2d\n"
-           "RAM FREE   : %5d B\n"
-           "AUTO REV   : %1d\n"
-           "SAFETY RAW : %1d\n"
-           "ADS CUR/V  : %c %c\n"
-           "GIMBAL ON  : %c\n"
-           "==============================",
-           tempDriverL,
-           tempDriverR,
-           volt_x10 / 10, abs(volt_x10 % 10),
-           curMax_x10 / 10, abs(curMax_x10 % 10),
-           curL,
-           curR,
-           cpuLoad_x10 / 10, abs(cpuLoad_x10 % 10),
-           cpuMargin_x10 / 10, abs(cpuMargin_x10 % 10),
-           (unsigned long)(now - lastIbusByte_ms),
-           wdS, wdC, wdD, wdB,
-           (uint8_t)activeFault,
-           freeRam(),
-           autoReverseCount,
-           (uint8_t)rawSafety,
-           adsCur,
-           adsVolt,
-           gimbalOn);
-
-  Serial.println(line);
+  // ================= CSV OUTPUT =================
+  Serial.print(now);
+  Serial.print(',');
+  Serial.print(tempDriverL);
+  Serial.print(',');
+  Serial.print(tempDriverR);
+  Serial.print(',');
+  Serial.print(volt_x10 / 10);
+  Serial.print('.');
+  Serial.print(abs(volt_x10 % 10));
+  Serial.print(',');
+  Serial.print(curMax_x10 / 10);
+  Serial.print('.');
+  Serial.print(abs(curMax_x10 % 10));
+  Serial.print(',');
+  Serial.print(curL);
+  Serial.print(',');
+  Serial.print(curR);
+  Serial.print(',');
+  Serial.print(cpuLoad_x10 / 10);
+  Serial.print('.');
+  Serial.print(abs(cpuLoad_x10 % 10));
+  Serial.print(',');
+  Serial.print(cpuMargin_x10 / 10);
+  Serial.print('.');
+  Serial.print(abs(cpuMargin_x10 % 10));
+  Serial.print(',');
+  Serial.print(now - lastIbusByte_ms);
+  Serial.print(',');
+  Serial.print(wdS);
+  Serial.print(',');
+  Serial.print(wdC);
+  Serial.print(',');
+  Serial.print(wdD);
+  Serial.print(',');
+  Serial.print(wdB);
+  Serial.print(',');
+  Serial.print((uint8_t)activeFault);
+  Serial.print(',');
+  Serial.print(freeRam());
+  Serial.print(',');
+  Serial.print(autoReverseCount);
+  Serial.print(',');
+  Serial.print((uint8_t)rawSafety);
+  Serial.print(',');
+  Serial.print(adsCur);
+  Serial.print(',');
+  Serial.print(adsVolt);
+  Serial.print(',');
+  Serial.println(gimbalOn);
 
 #endif
 }
+
 
 void updateDriveTarget() {
 
@@ -1034,7 +1088,6 @@ void updateDriveTarget() {
 
   // ==================================================
   // IBUS RECOVERY CONFIRM
-  // ต้องให้ stick กลับ neutral ก่อน
   // ==================================================
   if (requireIbusConfirm) {
 
@@ -1075,7 +1128,7 @@ void updateDriveTarget() {
   };
 
   // ==================================================
-  // IBUS SPIKE + RATE LIMIT FILTER (ANTI GLITCH)
+  // IBUS SPIKE + RATE LIMIT FILTER
   // ==================================================
   static uint16_t lastThr = 1500;
   static uint16_t lastStr = 1500;
@@ -1086,27 +1139,19 @@ void updateDriveTarget() {
   rawThr = constrain(rawThr, 1000, 2000);
   rawStr = constrain(rawStr, 1000, 2000);
 
-  // HARD SPIKE REJECT
   if (abs((int)rawThr - (int)lastThr) > 300)
     rawThr = lastThr;
 
   if (abs((int)rawStr - (int)lastStr) > 300)
     rawStr = lastStr;
 
-  // RATE LIMITER
   constexpr int16_t MAX_STEP = 80;
 
-  if (rawThr > lastThr + MAX_STEP)
-    rawThr = lastThr + MAX_STEP;
+  if (rawThr > lastThr + MAX_STEP) rawThr = lastThr + MAX_STEP;
+  if (rawThr < lastThr - MAX_STEP) rawThr = lastThr - MAX_STEP;
 
-  if (rawThr < lastThr - MAX_STEP)
-    rawThr = lastThr - MAX_STEP;
-
-  if (rawStr > lastStr + MAX_STEP)
-    rawStr = lastStr + MAX_STEP;
-
-  if (rawStr < lastStr - MAX_STEP)
-    rawStr = lastStr - MAX_STEP;
+  if (rawStr > lastStr + MAX_STEP) rawStr = lastStr + MAX_STEP;
+  if (rawStr < lastStr - MAX_STEP) rawStr = lastStr - MAX_STEP;
 
   lastThr = rawThr;
   lastStr = rawStr;
@@ -1116,60 +1161,61 @@ void updateDriveTarget() {
   // ==================================================
   int16_t thr = mapAxis(rawThr);
   int16_t str = mapAxis(rawStr);
-  if (abs(thr) < 50) {
-    targetL = 0;
-    targetR = 0;
-    return;
-  }
 
   // ==================================================
   // ZERO THROTTLE SAFETY
-  // ป้องกันรถหมุนเมื่อ throttle ≈ 0
   // ==================================================
   constexpr int16_t THR_STOP_BAND = 50;
 
   if (abs(thr) < THR_STOP_BAND) {
-
     targetL = 0;
     targetR = 0;
     return;
   }
 
-  float absThr = abs(thr);
-  float blend;
+  // ==================================================
+  // FIXED POINT MIXING
+  // ==================================================
+  int16_t absThr = abs(thr);
 
-  if (absThr <= 150.0f) {
-    blend = 0.0f;
-  } else if (absThr >= 450.0f) {
-    blend = 1.0f;
-  } else {
-    blend = (absThr - 150.0f) / (450.0f - 150.0f);
-  }
+  int16_t blend_x1000;
 
-  float arcL = (float)thr + (float)str;
-  float arcR = (float)thr - (float)str;
+  if (absThr <= 120)
+    blend_x1000 = 150;
 
-  float k = abs(str) / (float)PWM_TOP;
-  if (str < 0) k = -k;
+  else if (absThr >= 380)
+    blend_x1000 = 1000;
+  else
+    blend_x1000 = ((absThr - 150) * 1000) / 300;
 
-  float diffL = thr * (1.0f + k);
-  float diffR = thr * (1.0f - k);
+  int16_t arcL = constrain(thr + str, -PWM_TOP, PWM_TOP);
+  int16_t arcR = constrain(thr - str, -PWM_TOP, PWM_TOP);
 
-  float outL = arcL * (1.0f - blend) + diffL * blend;
-  float outR = arcR * (1.0f - blend) + diffR * blend;
+  int16_t k_x1000 = (abs(str) * 1000) / PWM_TOP;
+  if (str < 0) k_x1000 = -k_x1000;
 
-  float maxMag = max(abs(outL), abs(outR));
+  int32_t diffL = (int32_t)thr * (1000 + k_x1000);
+  int32_t diffR = (int32_t)thr * (1000 - k_x1000);
+
+  diffL /= 1000;
+  diffR /= 1000;
+
+  int32_t outL =
+    ((int32_t)arcL * (1000 - blend_x1000) + diffL * blend_x1000) / 1000;
+
+  int32_t outR =
+    ((int32_t)arcR * (1000 - blend_x1000) + diffR * blend_x1000) / 1000;
+
+  int32_t maxMag = max(abs(outL), abs(outR));
 
   if (maxMag > PWM_TOP) {
 
-    float scale = (float)PWM_TOP / maxMag;
-
-    outL *= scale;
-    outR *= scale;
+    outL = (outL * PWM_TOP) / maxMag;
+    outR = (outR * PWM_TOP) / maxMag;
   }
 
-  targetL = (int16_t)outL;
-  targetR = (int16_t)outR;
+  targetL = constrain(outL, -PWM_TOP, PWM_TOP);
+  targetR = constrain(outR, -PWM_TOP, PWM_TOP);
 }
 
 void updateEngineThrottle() {
@@ -1253,9 +1299,7 @@ void updateEngineState(uint32_t now) {
   }
 }
 
-// ============================================================================
-// PWM
-// ============================================================================
+
 // ============================================================================
 // PWM SETUP (SAFE AFTER MCU RESET)
 // ป้องกัน PWM spike หลัง watchdog / brownout reset
@@ -1311,12 +1355,12 @@ inline void setFanPWM_R(uint8_t pwm) {
   OCR5B = map(pwm, 0, 255, 0, ICR5);
 }
 
-
 // ============================================================================
 // FAN PWM (TIMER5 @ 15kHz)
 // FAN_L = pin 44 (OC5C)
 // FAN_R = pin 45 (OC5B)
 // ============================================================================
+
 void setupFanPWM15K() {
   // Fast PWM, TOP = ICR5
   TCCR5A = _BV(COM5B1) | _BV(COM5C1) | _BV(WGM51);
@@ -1427,6 +1471,11 @@ void backgroundFaultEEPROMTask(uint32_t now) {
   // --------------------------------------------------
   if (!faultWritePending)
     return;
+
+  if (faultToStore == FaultCode::NONE) {
+    faultWritePending = false;
+    return;
+  }
 
   // --------------------------------------------------
   // ANTI-WEAR LIMITS
@@ -1713,11 +1762,13 @@ bool calibrateCurrentOffsetNonBlocking(uint32_t now) {
 }
 
 // ============================================================================
-// IDLE CURRENT OFFSET AUTO RECALIBRATION
+// IDLE CURRENT OFFSET AUTO RECALIBRATION (NON-BLOCKING VERSION)
 // ปรับ offset ของ ACS sensor ช้า ๆ เมื่อรถหยุดนิ่ง
-// ป้องกัน thermal drift ของ sensor
+// ใช้ state machine อ่าน ADS1115 ทีละ channel
+// ป้องกัน for-loop return ที่ทำให้ channel อื่นไม่ได้อ่าน
 // ============================================================================
 void idleCurrentAutoRezero(uint32_t now) {
+
   // --------------------------------------------------
   // RUN ทุก 3 วินาที
   // --------------------------------------------------
@@ -1725,8 +1776,6 @@ void idleCurrentAutoRezero(uint32_t now) {
 
   if (now - lastRun_ms < 3000)
     return;
-
-  lastRun_ms = now;
 
   // --------------------------------------------------
   // เงื่อนไขต้อง "หยุดนิ่งจริง"
@@ -1747,37 +1796,98 @@ void idleCurrentAutoRezero(uint32_t now) {
     return;
 
   // --------------------------------------------------
-  // อ่านค่าดิบ ADS
+  // STATE MACHINE
   // --------------------------------------------------
-  for (uint8_t i = 0; i < 4; i++) {
-    uint16_t mux =
-      ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[i] << 12);
+  enum class RezeroState : uint8_t {
+    IDLE,
+    WAIT_CONV
+  };
 
-    adsCur.startADCReading(mux, false);
+  static RezeroState state = RezeroState::IDLE;
 
-    uint32_t t0 = millis();
+  static uint8_t ch = 0;
+  static uint32_t convStart_ms = 0;
 
-    while (!adsCur.conversionComplete()) {
-      if (millis() - t0 > 10)
+  constexpr uint16_t CONV_TIMEOUT_MS = 15;
+
+  switch (state) {
+
+    // --------------------------------------------------
+    // START NEW RECALIBRATION CYCLE
+    // --------------------------------------------------
+    case RezeroState::IDLE:
+      {
+
+        lastRun_ms = now;
+
+        ch = 0;
+
+        uint16_t mux =
+          ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[ch] << 12);
+
+        adsCur.startADCReading(mux, false);
+
+        convStart_ms = now;
+
+        state = RezeroState::WAIT_CONV;
+
         return;
-    }
-
-    int16_t raw = adsCur.getLastConversionResults();
-
-    float v = raw * ADS1115_LSB_V;
+      }
 
     // --------------------------------------------------
-    // Offset adjustment (slow LPF)
+    // WAIT FOR ADC CONVERSION
     // --------------------------------------------------
-    constexpr float OFFSET_ALPHA = 0.02f;
+    case RezeroState::WAIT_CONV:
+      {
 
-    g_acsOffsetV[i] =
-      g_acsOffsetV[i] + OFFSET_ALPHA * (v - g_acsOffsetV[i]);
-  }
+        if (!adsCur.conversionComplete()) {
+
+          if (now - convStart_ms > CONV_TIMEOUT_MS) {
+
+            // timeout → abort cycle
+            state = RezeroState::IDLE;
+          }
+
+          return;
+        }
+
+        int16_t raw = adsCur.getLastConversionResults();
+
+        float v = raw * ADS1115_LSB_V;
+
+        // --------------------------------------------------
+        // Offset adjustment (slow LPF)
+        // --------------------------------------------------
+        constexpr float OFFSET_ALPHA = 0.02f;
+
+        g_acsOffsetV[ch] =
+          g_acsOffsetV[ch] + OFFSET_ALPHA * (v - g_acsOffsetV[ch]);
+
+        // --------------------------------------------------
+        // NEXT CHANNEL
+        // --------------------------------------------------
+        ch++;
+
+        if (ch >= 4) {
 
 #if DEBUG_SERIAL
-  Serial.println(F("[ACS] IDLE REZERO"));
+          Serial.println(F("[ACS] IDLE REZERO"));
 #endif
+
+          state = RezeroState::IDLE;
+          return;
+        }
+
+        uint16_t mux =
+          ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[ch] << 12);
+
+        adsCur.startADCReading(mux, false);
+
+        convStart_ms = now;
+
+        return;
+      }
+  }
 }
 
 void i2cBusClear() {
@@ -1804,6 +1914,9 @@ void i2cBusClear() {
   }
 }
 
+
+
+
 bool updateSensors() {
 
   uint32_t now = millis();
@@ -1812,12 +1925,9 @@ bool updateSensors() {
   // SENSOR PRESENCE GUARD
   // ==================================================
   if (!adsCurPresent && !adsVoltPresent) {
-    return false;  // ไม่มี sensor → watchdog ไม่ feed
+    return false;
   }
 
-  // ==================================================
-  // SENSOR HEALTH FLAG
-  // ==================================================
   bool sensorHealthyThisCycle = false;
 
 #if TEST_MODE
@@ -1833,6 +1943,7 @@ bool updateSensors() {
   // ==================================================
   // ---------- I2C RECOVERY STATE MACHINE ----------
   // ==================================================
+
   enum class I2CRecoverState : uint8_t {
     IDLE,
     END_BUS,
@@ -1857,12 +1968,9 @@ bool updateSensors() {
     case I2CRecoverState::END_BUS:
 
       Wire.end();
-
       i2cState = I2CRecoverState::BEGIN_BUS;
       i2cStateStart_ms = now;
-
       return false;
-
 
     case I2CRecoverState::BEGIN_BUS:
 
@@ -1875,7 +1983,6 @@ bool updateSensors() {
 
       i2cState = I2CRecoverState::REINIT_ADS;
       return false;
-
 
     case I2CRecoverState::REINIT_ADS:
 
@@ -1895,7 +2002,6 @@ bool updateSensors() {
       i2cState = I2CRecoverState::DONE;
       return false;
 
-
     case I2CRecoverState::DONE:
 
       if (i2cResetCount >= 3) {
@@ -1912,78 +2018,120 @@ bool updateSensors() {
   // ==================================================
   // HARDWARE OVERCURRENT
   // ==================================================
+
   if (digitalRead(PIN_CUR_TRIP) == LOW) {
     latchFault(FaultCode::OVER_CURRENT);
     return false;
   }
 
   // ==================================================
-  // ----------- ASYNC CURRENT ------------------------
+  // ----------- ASYNC CURRENT (ADS1115) ---------------
+  // ROBUST VERSION (ANTI CHANNEL STALL)
   // ==================================================
+
   static uint8_t curIdx = 0;
   static bool curConvRunning = false;
   static uint32_t curConvStart_ms = 0;
+  static uint32_t curNextReady_ms = 0;
 
   constexpr uint16_t CUR_CONV_TIMEOUT_MS = 25;
 
   if (adsCurPresent) {
 
+    // --------------------------------------------------
+    // START NEW CONVERSION
+    // --------------------------------------------------
     if (!curConvRunning) {
 
       uint16_t mux =
         ADS1X15_REG_CONFIG_MUX_SINGLE_0 + (ADS_CUR_CH_MAP[curIdx] << 12);
 
       adsCur.startADCReading(mux, false);
+
       curConvRunning = true;
       curConvStart_ms = now;
 
-    } else {
+      // ADS1115 @250SPS ≈ 4ms conversion
+      curNextReady_ms = now + 4;
+    }
 
-      if (adsCur.conversionComplete()) {
+    // --------------------------------------------------
+    // WAIT CONVERSION
+    // --------------------------------------------------
+    else {
+
+      // ---------- CONVERSION COMPLETE ----------
+      if (now >= curNextReady_ms && adsCur.conversionComplete()) {
 
         int16_t raw = adsCur.getLastConversionResults();
+
         float v = raw * ADS1115_LSB_V;
         float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
 
+        // ---------- PLAUSIBILITY GUARD ----------
         if (a < CUR_MIN_PLAUSIBLE || a > CUR_MAX_PLAUSIBLE) {
           latchFault(FaultCode::CUR_SENSOR_FAULT);
           return false;
         }
 
+        // ---------- LPF FILTER ----------
         curA[curIdx] += CUR_LPF_ALPHA * (a - curA[curIdx]);
 
         sensorHealthyThisCycle = true;
 
+        // ---------- CURRENT SPIKE ----------
         if (a > CUR_SPIKE_A) {
+
           forceDriveSoftStop(now);
           bladeState = BladeState::SOFT_STOP;
         }
 
+        // ---------- HARD CURRENT LIMIT ----------
         if (a > CUR_TRIP_A_CH[curIdx]) {
+
           if (++overCurCnt[curIdx] >= 2) {
             latchFault(FaultCode::OVER_CURRENT);
             return false;
           }
+
         } else {
+
           overCurCnt[curIdx] = 0;
         }
 
+        // ---------- NEXT CHANNEL ----------
         curIdx++;
-        if (curIdx >= 4) curIdx = 0;
+        if (curIdx >= 4)
+          curIdx = 0;
 
         curConvRunning = false;
+      }
 
-      } else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
+      // ---------- CONVERSION TIMEOUT ----------
+      else if (now - curConvStart_ms > CUR_CONV_TIMEOUT_MS) {
+
+#if DEBUG_SERIAL
+        Serial.print(F("[ADS CUR] TIMEOUT CH="));
+        Serial.println(curIdx);
+#endif
+
+        // ข้าม channel นี้
+        curIdx++;
+        if (curIdx >= 4)
+          curIdx = 0;
+
         curConvRunning = false;
       }
     }
   }
 
   // ==================================================
-  // ----------- ASYNC VOLTAGE ------------------------
+  // ----------- ASYNC VOLTAGE -------------------------
   // ==================================================
+
   static bool voltConvRunning = false;
   static uint32_t voltConvStart_ms = 0;
+  static uint32_t voltNextReady_ms = 0;
   static uint32_t lastVoltOk_ms = 0;
   static uint8_t voltFailCnt = 0;
 
@@ -1998,24 +2146,27 @@ bool updateSensors() {
 
       voltConvRunning = true;
       voltConvStart_ms = now;
+      voltNextReady_ms = now + 4;
 
     } else {
 
-      if (adsVolt.conversionComplete()) {
+      if (now >= voltNextReady_ms && adsVolt.conversionComplete()) {
 
         int16_t raw =
           adsVolt.getLastConversionResults();
 
         float v_adc = raw * ADS1115_LSB_V;
+
         float vRaw =
           v_adc * ((150.0f + 33.0f) / 33.0f);
 
         float dv = vRaw - engineVolt;
 
-        if (fabs(dv) > 8.0f)
-          dv = (dv > 0) ? 8.0f : -8.0f;
+        if (dv > 8.0f) dv = 8.0f;
+        if (dv < -8.0f) dv = -8.0f;
 
         engineVolt += 0.15f * dv;
+
         if (vRaw > 0.0f && vRaw < 40.0f) {
 
           engineVolt += 0.15f * (vRaw - engineVolt);
@@ -2062,8 +2213,8 @@ bool updateSensors() {
 
     tempDriverL = tL;
     tempDriverR = tR;
-    lastTempOk_ms = now;
 
+    lastTempOk_ms = now;
     sensorHealthyThisCycle = true;
 
     if (tL > TEMP_TRIP_C || tR > TEMP_TRIP_C) {
@@ -2085,13 +2236,11 @@ bool updateSensors() {
 
     if (adsCurPresent || adsVoltPresent) {
 
-      if (curConvRunning || voltConvRunning) {
+      if (curConvRunning || voltConvRunning)
         return true;
-      }
 
-      if (sensorHealthyThisCycle) {
+      if (sensorHealthyThisCycle)
         return true;
-      }
 
       return false;
     }
@@ -2099,6 +2248,8 @@ bool updateSensors() {
 
   return false;
 }
+
+
 
 void runDrive(uint32_t now) {
   static DriveState lastDriveState = DriveState::IDLE;
@@ -2251,23 +2402,26 @@ void runBlade(uint32_t now) {
   }
 }
 
+constexpr uint16_t WD_GRACE_MS = 40;
+
 void monitorSubsystemWatchdogs(uint32_t now) {
-  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms) {
+
+  if (now - wdSensor.lastUpdate_ms > wdSensor.timeout_ms + WD_GRACE_MS) {
     latchFault(FaultCode::LOGIC_WATCHDOG);
     wdSensor.faulted = true;
   }
 
-  if (now - wdComms.lastUpdate_ms > wdComms.timeout_ms) {
+  if (now - wdComms.lastUpdate_ms > wdComms.timeout_ms + WD_GRACE_MS) {
     latchFault(FaultCode::IBUS_LOST);
     wdComms.faulted = true;
   }
 
-  if (now - wdDrive.lastUpdate_ms > wdDrive.timeout_ms) {
+  if (now - wdDrive.lastUpdate_ms > wdDrive.timeout_ms + WD_GRACE_MS) {
     latchFault(FaultCode::DRIVE_TIMEOUT);
     wdDrive.faulted = true;
   }
 
-  if (now - wdBlade.lastUpdate_ms > wdBlade.timeout_ms) {
+  if (now - wdBlade.lastUpdate_ms > wdBlade.timeout_ms + WD_GRACE_MS) {
     latchFault(FaultCode::BLADE_TIMEOUT);
     wdBlade.faulted = true;
   }
@@ -2328,16 +2482,12 @@ void applyDrive() {
   // ==================================================
   // AUTO REVERSE
   // ==================================================
-  if (autoReverseActive &&
-      !ibusCommLost &&
-      !requireIbusConfirm &&
-      systemState == SystemState::ACTIVE &&
-      (abs(targetL) > 100 || abs(targetR) > 100)) {
+  if (autoReverseActive && !ibusCommLost && !requireIbusConfirm && systemState == SystemState::ACTIVE && (abs(targetL) > 100 || abs(targetR) > 100)) {
 
     if (now - autoReverseStart_ms < AUTO_REV_MS) {
 
-      int16_t refL = (finalTargetL != 0) ? finalTargetL : curL;
-      int16_t refR = (finalTargetR != 0) ? finalTargetR : curR;
+      int16_t refL = (curL != 0) ? curL : targetL;
+      int16_t refR = (curR != 0) ? curR : targetR;
 
       int8_t dirL = (refL > 0) ? -1 : (refL < 0 ? 1 : -1);
       int8_t dirR = (refR > 0) ? -1 : (refR < 0 ? 1 : -1);
@@ -2369,11 +2519,23 @@ void applyDrive() {
 
   if (diff > TRACTION_DIFF) {
 
-    if (curA_L > curA_R)
-      finalTargetL *= 0.75f;
-    else
-      finalTargetR *= 0.75f;
+    constexpr float TRACTION_REDUCE = 0.75f;
+    constexpr float TRACTION_BOOST = 1.10f;
+
+    if (curA_L > curA_R) {
+
+      finalTargetL *= TRACTION_REDUCE;
+      finalTargetR *= TRACTION_BOOST;
+
+    } else {
+
+      finalTargetR *= TRACTION_REDUCE;
+      finalTargetL *= TRACTION_BOOST;
+    }
   }
+
+  finalTargetL = constrain(finalTargetL, -PWM_TOP, PWM_TOP);
+  finalTargetR = constrain(finalTargetR, -PWM_TOP, PWM_TOP);
 
   // ==================================================
   // TORQUE LIMIT
@@ -2452,60 +2614,105 @@ void applyDrive() {
   }
 
   // ==================================================
-  // REVERSE BRAKE WINDOW
+  // REVERSE BRAKE WINDOW (EDGE SAFE VERSION)
+  // ป้องกัน brake oscillation เมื่อ RC ค้าง reverse
   // ==================================================
   static uint32_t regenBlockUntil = 0;
+  static bool reverseWindowActive = false;
 
+  static int8_t lastTargetSignL = 0;
+  static int8_t lastTargetSignR = 0;
+
+  int8_t signL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
+  int8_t signR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
+
+  // --------------------------------------------------
+  // Detect direction change (edge trigger)
+  // --------------------------------------------------
   bool reverseRequest =
-    (curL > 0 && finalTargetL < 0) ||
-    (curL < 0 && finalTargetL > 0) ||
-    (curR > 0 && finalTargetR < 0) ||
-    (curR < 0 && finalTargetR > 0);
+    (signL != 0 && signL != lastTargetSignL) || (signR != 0 && signR != lastTargetSignR);
+
+  lastTargetSignL = signL;
+  lastTargetSignR = signR;
 
   constexpr uint16_t REVERSE_BRAKE_MS = 180;
 
-  if (reverseRequest && regenBlockUntil == 0)
-    regenBlockUntil = now + REVERSE_BRAKE_MS;
+  // --------------------------------------------------
+  // Start brake window only once per direction change
+  // --------------------------------------------------
+  if (reverseRequest && !reverseWindowActive) {
 
-  if (regenBlockUntil) {
+    regenBlockUntil = now + REVERSE_BRAKE_MS;
+    reverseWindowActive = true;
+  }
+
+  // --------------------------------------------------
+  // Active brake window
+  // --------------------------------------------------
+  if (reverseWindowActive) {
 
     if (now < regenBlockUntil) {
 
+      // Cut torque during reverse braking window
       finalTargetL = 0;
       finalTargetR = 0;
 
+      digitalWrite(PIN_DRV_ENABLE, LOW);
+
+      curL = 0;
+      curR = 0;
+
     } else {
 
+      // Window finished
+      reverseWindowActive = false;
       regenBlockUntil = 0;
     }
   }
 
   // ==================================================
-  // RAMP CONTROL
+  // ADAPTIVE RAMP CONTROL
   // ==================================================
-  static int16_t stepCurrent = 2;
+  int16_t errL = abs(finalTargetL - curL);
+  int16_t errR = abs(finalTargetR - curR);
 
-  int16_t stepTarget;
+  int16_t errMax = max(errL, errR);
 
-  if (curMax > 60)
-    stepTarget = 2;
-  else if (driveState == DriveState::LIMP)
-    stepTarget = 3;
+  int16_t step;
+
+  if (driveState == DriveState::LIMP)
+    step = 2;
+  else if (errMax > 600)
+    step = 3;
+  else if (errMax > 300)
+    step = 4;
   else
-    stepTarget = 5;
-
-  if (stepCurrent < stepTarget)
-    stepCurrent++;
-  else if (stepCurrent > stepTarget)
-    stepCurrent--;
-
-  int16_t step = stepCurrent;
+    step = 6;
 
   // ==================================================
-  // DRIVER ENABLE
+  // DRIVER ENABLE + SETTLE WINDOW (SPIKE SAFE)
   // ==================================================
+
+  static bool lastDriverEnabled = false;
+  static uint32_t driverEnableTime_ms = 0;
+
   bool driverEnabled = digitalRead(PIN_DRV_ENABLE);
 
+  // --------------------------------------------------
+  // Detect driver enable edge
+  // --------------------------------------------------
+  if (driverEnabled && !lastDriverEnabled) {
+
+    driverEnableTime_ms = now;
+
+    // reset ramp state when driver just enabled
+    curL = 0;
+    curR = 0;
+  }
+
+  // --------------------------------------------------
+  // Driver disabled → force zero
+  // --------------------------------------------------
   if (!driverEnabled) {
 
     curL = 0;
@@ -2513,13 +2720,28 @@ void applyDrive() {
 
     finalTargetL = 0;
     finalTargetR = 0;
+  }
 
-  } else {
+  // --------------------------------------------------
+  // Driver settling window
+  // --------------------------------------------------
+  else if (now - driverEnableTime_ms < 40) {
+
+    // hold outputs during driver stabilization
+    curL = 0;
+    curR = 0;
+  }
+
+  // --------------------------------------------------
+  // Normal ramp control
+  // --------------------------------------------------
+  else {
 
     curL = ramp(curL, finalTargetL, step);
     curR = ramp(curR, finalTargetR, step);
   }
 
+  lastDriverEnabled = driverEnabled;
   // ==================================================
   // SAFE DIR SWITCH (NON-BLOCKING DEADTIME)
   // ==================================================
@@ -2533,9 +2755,8 @@ void applyDrive() {
   static uint32_t dirSwitchStartR_us = 0;
 
   constexpr uint16_t DIR_DEADTIME_US = 12;
-
-  int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
-  int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
+  int8_t dirL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
+  int8_t dirR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
 
   uint32_t now_us = micros();
 
@@ -3281,6 +3502,7 @@ void loop() {
   // ==================================================
   // DRIVE EVENT LAYER
   // ==================================================
+  memcpy(curA_snapshot, curA, sizeof(curA));
   lastDriveEvent = DriveEvent::NONE;
 
   updateEngineState(now);
@@ -3468,6 +3690,19 @@ void loop() {
 
   bool rcSafe = thrNeutral && strNeutral;
 
+  // --------------------------------------------------
+  // เพิ่ม safety guards
+  // --------------------------------------------------
+
+  bool targetSafe =
+    (targetL == 0) && (targetR == 0);
+
+  bool ibusConfirmed =
+    !requireIbusConfirm;
+
+  bool autoReverseInactive =
+    !autoReverseActive;
+
   constexpr uint32_t DRIVER_ARM_MS = 80;
   constexpr uint32_t DRIVER_SETTLE_MS = 40;
 
@@ -3483,7 +3718,7 @@ void loop() {
   }
 
   // ---------------- ARM DRIVER ----------------
-  else if (runAllowed && pwmSafe && rcSafe) {
+  else if (runAllowed && pwmSafe && rcSafe && targetSafe && ibusConfirmed && autoReverseInactive) {
 
     if (driveEnableArmStart_ms == 0)
       driveEnableArmStart_ms = now;
@@ -3559,3 +3794,4 @@ void loop() {
     digitalWrite(PIN_HW_WD_HB, LOW);
   }
 }
+
