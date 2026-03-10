@@ -2898,30 +2898,23 @@ void applyDrive() {
   // --------------------------------------------------
   if (reverseBrakeActive) {
 
-    if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
+  if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
 
       setPWM_L(0);
       setPWM_R(0);
 
       motorShortBrake();
 
-      curL = 0;
-      curR = 0;
-
       return;
     } else {
 
-      reverseBrakeActive = false;
+  reverseBrakeActive = false;
 
-      // ปลด short brake → DIR neutral
-      digitalWrite(DIR_L1, LOW);
-      digitalWrite(DIR_L2, LOW);
-      digitalWrite(DIR_R1, LOW);
-      digitalWrite(DIR_R2, LOW);
-
-      curL = 0;
-      curR = 0;
-    }
+  digitalWrite(DIR_L1, LOW);
+  digitalWrite(DIR_L2, LOW);
+  digitalWrite(DIR_R1, LOW);
+  digitalWrite(DIR_R2, LOW);
+}
   }
 
   // ==================================================
@@ -4099,3 +4092,4 @@ void loop() {
   // update loop progress marker
   lastLoopProgress_ms = now;
 }
+
