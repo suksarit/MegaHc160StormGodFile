@@ -138,6 +138,15 @@ constexpr uint32_t ENGINE_CONFIRM_MS = 900;
 constexpr uint8_t MAX_AUTO_REVERSE = 2;
 uint8_t autoReverseCount = 0;
 
+// --------------------------------------------------
+// AUTO REVERSE RECOVERY GUARD
+// --------------------------------------------------
+
+bool reverseRecoveryActive = false;
+uint32_t reverseRecoveryStart_ms = 0;
+
+constexpr uint32_t REVERSE_RECOVERY_MS = 800;
+
 // ============================================================================
 // FAULT CONTROL (NO SENSOR STALL)
 // ============================================================================
@@ -205,6 +214,22 @@ int16_t targetL = 0;
 int16_t targetR = 0;
 int16_t curL = 0;
 int16_t curR = 0;
+
+// ==================================================
+// DRIVER REARM FLAG (GLOBAL)
+// ==================================================
+bool driverRearmRequired = true;
+
+// ============================================================================
+// MOTOR STALL ENERGY PROTECTION
+// ============================================================================
+
+float stallEnergy = 0.0f;
+uint32_t stallEnergyLast_ms = 0;
+
+constexpr float STALL_CURRENT_A = 65.0f;   // current threshold
+constexpr float STALL_POWER_LIMIT = 1.0f;  // energy limit
+constexpr float STALL_DECAY = 0.92f;       // energy decay per loop
 
 // ==================================================
 // IMBALANCE CORRECTION LAYER (NO TARGET DRIFT)
@@ -496,14 +521,77 @@ inline float curRight() {
 }
 
 // ============================================================================
-// AUTO REVERSE (FIELD-SAFE VERSION)
+// MOTOR STALL ENERGY PROTECTION
+// จำกัดพลังงานเมื่อมอเตอร์ติดหรือล้อไม่หมุน
+// ============================================================================
+
+float computeStallScale(uint32_t now, float curL_A, float curR_A) {
+
+  float curMax = max(curL_A, curR_A);
+
+  uint32_t dt = now - stallEnergyLast_ms;
+  stallEnergyLast_ms = now;
+
+  if (dt > 200) dt = 200;
+
+  float dtSec = dt * 0.001f;
+
+  // --------------------------------------------------
+  // ENERGY INTEGRATION
+  // --------------------------------------------------
+
+  if (curMax > STALL_CURRENT_A) {
+
+    float excess = curMax - STALL_CURRENT_A;
+
+    stallEnergy += excess * dtSec * 0.02f;
+
+  } else {
+
+    stallEnergy *= STALL_DECAY;
+  }
+
+  if (stallEnergy < 0)
+    stallEnergy = 0;
+
+  // --------------------------------------------------
+  // SCALE COMPUTATION
+  // --------------------------------------------------
+
+  if (stallEnergy < STALL_POWER_LIMIT)
+    return 1.0f;
+
+  float scale = STALL_POWER_LIMIT / stallEnergy;
+
+  if (scale < 0.25f)
+    scale = 0.25f;
+
+  return scale;
+}
+
+// ============================================================================
+// AUTO REVERSE (IMPROVED FIELD VERSION)
+// ป้องกัน reverse oscillation ในหญ้าหนา
 // ============================================================================
 void startAutoReverse(uint32_t now) {
+
   // --------------------------------------------------
   // SAFETY GUARD
   // --------------------------------------------------
   if (getDriveSafety() != SafetyState::SAFE)
     return;
+
+  // --------------------------------------------------
+  // RECOVERY WINDOW
+  // ป้องกัน reverse ซ้ำทันทีหลังจาก reverse จบ
+  // --------------------------------------------------
+  if (reverseRecoveryActive) {
+
+    if (now - reverseRecoveryStart_ms < REVERSE_RECOVERY_MS)
+      return;
+
+    reverseRecoveryActive = false;
+  }
 
   // --------------------------------------------------
   // AUTO REVERSE WINDOW RESET
@@ -514,6 +602,7 @@ void startAutoReverse(uint32_t now) {
     autoRevWindowStart_ms = now;
 
   if (now - autoRevWindowStart_ms > AUTO_REV_RESET_WINDOW_MS) {
+
     autoReverseCount = 0;
     autoRevWindowStart_ms = now;
   }
@@ -521,7 +610,9 @@ void startAutoReverse(uint32_t now) {
   // --------------------------------------------------
   // HARD GUARD
   // --------------------------------------------------
-  if (autoReverseActive) return;
+  if (autoReverseActive)
+    return;
+
   if (autoReverseCount >= MAX_AUTO_REVERSE) {
 
 #if DEBUG_SERIAL
@@ -536,7 +627,7 @@ void startAutoReverse(uint32_t now) {
   // COOLDOWN (CRITICAL FOR FIELD)
   // --------------------------------------------------
   static uint32_t lastAutoRev_ms = 0;
-  constexpr uint32_t AUTO_REV_COOLDOWN_MS = 1500;  // กัน reverse ถี่เกิน
+  constexpr uint32_t AUTO_REV_COOLDOWN_MS = 1500;
 
   if (lastAutoRev_ms != 0 && now - lastAutoRev_ms < AUTO_REV_COOLDOWN_MS) {
     return;
@@ -560,8 +651,10 @@ void startAutoReverse(uint32_t now) {
   // --------------------------------------------------
   autoReverseActive = true;
   autoReverseStart_ms = now;
+
   autoReverseCount++;
   lastAutoRev_ms = now;
+
   lastDriveEvent = DriveEvent::AUTO_REVERSE;
 
 #if DEBUG_SERIAL
@@ -673,11 +766,18 @@ void detectSideImbalanceAndSteer() {
 }
 
 // ============================================================================
-// WHEEL STUCK DETECTION (FIELD TUNED VERSION)
+// WHEEL STUCK DETECTION (FIELD STABLE VERSION)
 // ตรวจจับล้อติด / ล้อจม โดยใช้ current imbalance + adaptive threshold
+// เพิ่ม guards เพื่อลด false trigger ในสนามจริง
 // ============================================================================
 
 void detectWheelStuck(uint32_t now) {
+
+  // --------------------------------------------------
+  // GUARD : ห้ามตรวจ stuck ระหว่าง auto reverse
+  // --------------------------------------------------
+  if (autoReverseActive)
+    return;
 
   // --------------------------------------------------
   // GLOBAL COOLDOWN กัน oscillation reverse
@@ -695,7 +795,7 @@ void detectWheelStuck(uint32_t now) {
   constexpr int16_t MIN_PWM_FOR_STUCK = 300;
   constexpr int16_t TURNING_DIFF_MAX = 250;
 
-  constexpr float CURRENT_HYST = 2.0f;  // กัน sensor jitter
+  constexpr float CURRENT_HYST = 3.0f;  // เพิ่ม hysteresis กัน sensor jitter
 
   // --------------------------------------------------
   // ต้องมีแรงขับจริง
@@ -706,25 +806,40 @@ void detectWheelStuck(uint32_t now) {
     return;
 
   // --------------------------------------------------
-  // ห้ามอยู่ในช่วง turning
+  // GUARD : ต้องไม่อยู่ในช่วง turning
   // --------------------------------------------------
   if (abs(curL - curR) > TURNING_DIFF_MAX)
     return;
 
   // --------------------------------------------------
-  // CURRENT
+  // CURRENT READ
   // --------------------------------------------------
   float cL = curLeft();
   float cR = curRight();
 
   float maxCur = max(cL, cR);
 
-  // โหลดต่ำไม่ถือว่า stuck
+  // --------------------------------------------------
+  // CURRENT PLAUSIBILITY
+  // --------------------------------------------------
+  if (!isfinite(cL) || !isfinite(cR))
+    return;
+
+  if (maxCur <= 0.01f)
+    return;
+
+  // --------------------------------------------------
+  // LOAD ต่ำไม่ถือว่า stuck
+  // --------------------------------------------------
   if (maxCur < CUR_WARN_A)
     return;
 
-  // ป้องกัน division error
-  if (maxCur <= 0.01f)
+  // --------------------------------------------------
+  // CURRENT FLOOR GUARD (กัน sensor noise)
+  // --------------------------------------------------
+  constexpr float MIN_VALID_CURRENT = 6.0f;
+
+  if (maxCur < MIN_VALID_CURRENT)
     return;
 
   // --------------------------------------------------
@@ -733,11 +848,11 @@ void detectWheelStuck(uint32_t now) {
   float percentThreshold;
 
   if (pwmMag < 400)
-    percentThreshold = 0.35f;
+    percentThreshold = 0.40f;
   else if (pwmMag < 700)
-    percentThreshold = 0.45f;
+    percentThreshold = 0.50f;
   else
-    percentThreshold = 0.55f;
+    percentThreshold = 0.60f;
 
   // --------------------------------------------------
   // GRASS DENSITY ESTIMATOR
@@ -752,17 +867,9 @@ void detectWheelStuck(uint32_t now) {
 
   rippleAvg = rippleAvg * 0.85f + ripple * 0.15f;
 
-  // ถ้าหญ้าหนา → ผ่อน threshold
-  if (rippleAvg > 6.0f)
+  // หญ้าหนา → ผ่อน threshold
+  if (rippleAvg > 7.0f)
     percentThreshold *= 1.25f;
-
-  // --------------------------------------------------
-  // CURRENT FLOOR GUARD (กัน noise)
-  // --------------------------------------------------
-  constexpr float MIN_VALID_CURRENT = 5.0f;
-
-  if (maxCur < MIN_VALID_CURRENT)
-    return;
 
   // --------------------------------------------------
   // DIFFERENCE
@@ -778,9 +885,9 @@ void detectWheelStuck(uint32_t now) {
   if (pwmMag < 400)
     stuckTime = 700;
   else if (pwmMag < 700)
-    stuckTime = 500;
+    stuckTime = 520;
   else
-    stuckTime = 320;
+    stuckTime = 350;
 
   static uint32_t leftStart_ms = 0;
   static uint32_t rightStart_ms = 0;
@@ -1097,7 +1204,10 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
 #endif
 }
 
-
+// ============================================================================
+// UPDATE DRIVE TARGET (STABLE RC VERSION)
+// RC filter + spike guard + smooth mixing
+// ============================================================================
 void updateDriveTarget() {
 
   // ==================================================
@@ -1111,16 +1221,35 @@ void updateDriveTarget() {
   }
 
   // ==================================================
+  // READ IBUS ONCE
+  // ==================================================
+  uint16_t rawThr = ibus.readChannel(CH_THROTTLE);
+  uint16_t rawStr = ibus.readChannel(CH_STEER);
+
+  // ==================================================
+  // IBUS PLAUSIBILITY
+  // ==================================================
+  if (rawThr < 900 || rawThr > 2100 || rawStr < 900 || rawStr > 2100) {
+
+    targetL = 0;
+    targetR = 0;
+    return;
+  }
+
+  // ==================================================
   // IBUS RECOVERY CONFIRM
   // ==================================================
   if (requireIbusConfirm) {
 
-    bool thrNeutral = neutral(ibus.readChannel(CH_THROTTLE));
-    bool strNeutral = neutral(ibus.readChannel(CH_STEER));
+    bool thrNeutral = neutral(rawThr);
+    bool strNeutral = neutral(rawStr);
 
     if (thrNeutral && strNeutral) {
+
       requireIbusConfirm = false;
+
     } else {
+
       targetL = 0;
       targetR = 0;
       return;
@@ -1128,7 +1257,39 @@ void updateDriveTarget() {
   }
 
   // ==================================================
-  // AXIS MAPPING FUNCTION
+  // RC SPIKE + RATE FILTER
+  // ==================================================
+  static uint16_t lastThr = 1500;
+  static uint16_t lastStr = 1500;
+
+  constexpr int16_t RC_SPIKE_LIMIT = 300;
+  constexpr int16_t RC_RATE_LIMIT = 80;
+
+  // spike guard
+  if (abs((int)rawThr - (int)lastThr) > RC_SPIKE_LIMIT)
+    rawThr = lastThr;
+
+  if (abs((int)rawStr - (int)lastStr) > RC_SPIKE_LIMIT)
+    rawStr = lastStr;
+
+  // rate limiter
+  if (rawThr > lastThr + RC_RATE_LIMIT)
+    rawThr = lastThr + RC_RATE_LIMIT;
+
+  if (rawThr < lastThr - RC_RATE_LIMIT)
+    rawThr = lastThr - RC_RATE_LIMIT;
+
+  if (rawStr > lastStr + RC_RATE_LIMIT)
+    rawStr = lastStr + RC_RATE_LIMIT;
+
+  if (rawStr < lastStr - RC_RATE_LIMIT)
+    rawStr = lastStr - RC_RATE_LIMIT;
+
+  lastThr = rawThr;
+  lastStr = rawStr;
+
+  // ==================================================
+  // AXIS MAPPING
   // ==================================================
   auto mapAxis = [](int16_t v) -> int16_t {
     constexpr int16_t IN_MIN = 1000;
@@ -1143,55 +1304,15 @@ void updateDriveTarget() {
       return 0;
 
     if (v < DB_MIN) {
+
       long m = map(v, IN_MIN, DB_MIN, -OUT_MAX, 0);
-      return (int16_t)constrain(m, -OUT_MAX, 0);
+      return constrain((int16_t)m, -OUT_MAX, 0);
     }
 
     long m = map(v, DB_MAX, IN_MAX, 0, OUT_MAX);
-    return (int16_t)constrain(m, 0, OUT_MAX);
+    return constrain((int16_t)m, 0, OUT_MAX);
   };
 
-  // ==================================================
-  // IBUS SPIKE + RATE LIMIT FILTER
-  // ==================================================
-  static uint16_t lastThr = 1500;
-  static uint16_t lastStr = 1500;
-
-  uint16_t rawThr = ibus.readChannel(CH_THROTTLE);
-  uint16_t rawStr = ibus.readChannel(CH_STEER);
-
-  // RC RATE LIMIT GUARD
-  constexpr int RC_MAX_STEP = 120;
-
-  if (abs((int)rawThr - (int)lastThr) > RC_MAX_STEP)
-    rawThr = lastThr;
-
-  if (abs((int)rawStr - (int)lastStr) > RC_MAX_STEP)
-    rawStr = lastStr;
-
-  rawThr = constrain(rawThr, 1000, 2000);
-  rawStr = constrain(rawStr, 1000, 2000);
-
-  if (abs((int)rawThr - (int)lastThr) > 300)
-    rawThr = lastThr;
-
-  if (abs((int)rawStr - (int)lastStr) > 300)
-    rawStr = lastStr;
-
-  constexpr int16_t MAX_STEP = 80;
-
-  if (rawThr > lastThr + MAX_STEP) rawThr = lastThr + MAX_STEP;
-  if (rawThr < lastThr - MAX_STEP) rawThr = lastThr - MAX_STEP;
-
-  if (rawStr > lastStr + MAX_STEP) rawStr = lastStr + MAX_STEP;
-  if (rawStr < lastStr - MAX_STEP) rawStr = lastStr - MAX_STEP;
-
-  lastThr = rawThr;
-  lastStr = rawStr;
-
-  // ==================================================
-  // MAP RC TO MOTOR COMMAND
-  // ==================================================
   int16_t thr = mapAxis(rawThr);
   int16_t str = mapAxis(rawStr);
 
@@ -1201,16 +1322,23 @@ void updateDriveTarget() {
   constexpr int16_t THR_STOP_BAND = 50;
 
   if (abs(thr) < THR_STOP_BAND) {
+
     targetL = 0;
     targetR = 0;
     return;
   }
 
   // ==================================================
-  // FIXED POINT MIXING
+  // LOW SPEED STEER DAMP
   // ==================================================
   int16_t absThr = abs(thr);
 
+  if (absThr < 200)
+    str = str * 0.6;
+
+  // ==================================================
+  // FIXED POINT MIXING
+  // ==================================================
   int16_t blend_x1000;
 
   if (absThr <= 120)
@@ -1218,14 +1346,17 @@ void updateDriveTarget() {
 
   else if (absThr >= 380)
     blend_x1000 = 1000;
+
   else
-    blend_x1000 = ((absThr - 150) * 1000) / 300;
+    blend_x1000 = ((absThr - 120) * 1000) / 260;
 
   int16_t arcL = constrain(thr + str, -PWM_TOP, PWM_TOP);
   int16_t arcR = constrain(thr - str, -PWM_TOP, PWM_TOP);
 
   int16_t k_x1000 = (abs(str) * 1000) / PWM_TOP;
-  if (str < 0) k_x1000 = -k_x1000;
+
+  if (str < 0)
+    k_x1000 = -k_x1000;
 
   int32_t diffL = (int32_t)thr * (1000 + k_x1000);
   int32_t diffR = (int32_t)thr * (1000 - k_x1000);
@@ -1239,6 +1370,9 @@ void updateDriveTarget() {
   int32_t outR =
     ((int32_t)arcR * (1000 - blend_x1000) + diffR * blend_x1000) / 1000;
 
+  // ==================================================
+  // NORMALIZE
+  // ==================================================
   int32_t maxMag = max(abs(outL), abs(outR));
 
   if (maxMag > PWM_TOP) {
@@ -1989,7 +2123,9 @@ bool updateSensors() {
   static uint32_t i2cStateStart_ms = 0;
   static uint8_t i2cResetCount = 0;
 
-  if (Wire.getWireTimeoutFlag() && i2cState == I2CRecoverState::IDLE) {
+  static uint32_t lastRecover_ms = 0;
+
+  if (Wire.getWireTimeoutFlag() && i2cState == I2CRecoverState::IDLE && (now - lastRecover_ms > 2000)) {
 
     Wire.clearWireTimeoutFlag();
     i2cState = I2CRecoverState::END_BUS;
@@ -2038,9 +2174,13 @@ bool updateSensors() {
 
     case I2CRecoverState::DONE:
 
+      static uint32_t lastRecover_ms = 0;
+
       if (i2cResetCount >= 3) {
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
       }
+
+      lastRecover_ms = now;
 
       i2cState = I2CRecoverState::IDLE;
       return false;
@@ -2514,7 +2654,6 @@ void applyDrive() {
   // ==================================================
   // DRIVER REARM
   // ==================================================
-  static bool driverRearmRequired = true;
 
   bool thrNeutral = neutral(ibus.readChannel(CH_THROTTLE));
   bool strNeutral = neutral(ibus.readChannel(CH_STEER));
@@ -2561,8 +2700,10 @@ void applyDrive() {
       finalTargetR = dirR * AUTO_REV_PWM;
 
     } else {
-
       autoReverseActive = false;
+
+      reverseRecoveryActive = true;
+      reverseRecoveryStart_ms = now;
     }
   }
 
@@ -2661,6 +2802,16 @@ void applyDrive() {
     finalTargetL *= scale;
     finalTargetR *= scale;
   }
+
+  // ==================================================
+  // MOTOR STALL ENERGY PROTECTION
+  // ==================================================
+
+  float stallScale =
+    computeStallScale(now, curA_L, curA_R);
+
+  finalTargetL *= stallScale;
+  finalTargetR *= stallScale;
 
   // ==================================================
   // TRACTION CONTROL (ANTI WHEEL SPIN)
@@ -2816,14 +2967,50 @@ void applyDrive() {
   static uint32_t dirSwitchStartL_us = 0;
   static uint32_t dirSwitchStartR_us = 0;
 
-  constexpr uint16_t DIR_DEADTIME_US = 80;
+  constexpr uint16_t DIR_DEADTIME_US = 200;
 
   int8_t dirL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
   int8_t dirR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
 
   uint32_t now_us = micros();
+  // --------------------------------------------------
+  // PWM ZERO HOLD GUARD
+  // ต้องให้ PWM = 0 ต่อเนื่องก่อนเปลี่ยน DIR
+  // --------------------------------------------------
 
-  if (dirL != lastDirL && !dirSwitchPendingL) {
+  static uint32_t pwmZeroStartL_us = 0;
+  static uint32_t pwmZeroStartR_us = 0;
+
+  bool pwmZeroL = (abs(curL) == 0);
+  bool pwmZeroR = (abs(curR) == 0);
+
+  if (pwmZeroL) {
+
+    if (pwmZeroStartL_us == 0)
+      pwmZeroStartL_us = now_us;
+
+  } else {
+
+    pwmZeroStartL_us = 0;
+  }
+
+  if (pwmZeroR) {
+
+    if (pwmZeroStartR_us == 0)
+      pwmZeroStartR_us = now_us;
+
+  } else {
+
+    pwmZeroStartR_us = 0;
+  }
+
+  bool pwmHoldL =
+    (pwmZeroStartL_us != 0) && (now_us - pwmZeroStartL_us > 200);
+
+  bool pwmHoldR =
+    (pwmZeroStartR_us != 0) && (now_us - pwmZeroStartR_us > 200);
+
+  if (dirL != lastDirL && !dirSwitchPendingL && pwmHoldL) {
 
     setPWM_L(0);
     curL = 0;
@@ -2831,6 +3018,7 @@ void applyDrive() {
     dirSwitchPendingL = true;
     dirSwitchStartL_us = now_us;
   }
+
   if (dirSwitchPendingL && now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
 
     digitalWrite(DIR_L1, dirL > 0);
@@ -2840,7 +3028,7 @@ void applyDrive() {
     lastDirL = dirL;
   }
 
-  if (dirR != lastDirR && !dirSwitchPendingR) {
+  if (dirR != lastDirR && !dirSwitchPendingR && pwmHoldR) {
 
     setPWM_R(0);
     curR = 0;
@@ -3154,6 +3342,9 @@ void updateSystemState(uint32_t now) {
     // --------------------------------------------
     case SystemState::INIT:
       {
+        // --- RESET DRIVER REARM ---
+        extern bool driverRearmRequired;
+        driverRearmRequired = true;
 
         if (ibusCommLost) {
           ibusStableStart_ms = 0;
@@ -3749,11 +3940,27 @@ void loop() {
   bool rcSafe = thrNeutral && strNeutral;
 
   // --------------------------------------------------
-  // เพิ่ม safety guards
+  // TARGET STABILITY GUARD
+  // ต้องนิ่งก่อน enable driver
   // --------------------------------------------------
 
-  bool targetSafe =
+  static uint32_t targetStableStart_ms = 0;
+
+  bool targetNowZero =
     (targetL == 0) && (targetR == 0);
+
+  if (targetNowZero) {
+
+    if (targetStableStart_ms == 0)
+      targetStableStart_ms = now;
+
+  } else {
+
+    targetStableStart_ms = 0;
+  }
+
+  bool targetSafe =
+    (targetStableStart_ms != 0) && (now - targetStableStart_ms >= 50);
 
   bool ibusConfirmed =
     !requireIbusConfirm;
@@ -3853,11 +4060,29 @@ void loop() {
 #endif
 
   // ==================================================
-  // WATCHDOG FEED (PROGRESS SAFE)
+  // WATCHDOG FEED (PROGRESS SAFE + RAM GUARD)
   // ==================================================
 
   static uint32_t lastLoopProgress_ms = 0;
 
+  // --------------------------------------------------
+  // RAM GUARD (CRITICAL FOR MEGA2560)
+  // --------------------------------------------------
+  int freeMem = freeRam();
+
+  if (freeMem < 400) {
+
+#if DEBUG_SERIAL
+    Serial.print(F("[RAM] LOW MEMORY: "));
+    Serial.println(freeMem);
+#endif
+
+    latchFault(FaultCode::LOGIC_WATCHDOG);
+  }
+
+  // --------------------------------------------------
+  // WATCHDOG HEALTH CHECK
+  // --------------------------------------------------
   bool wdHealthy =
     !wdSensor.faulted && !wdComms.faulted && !wdDrive.faulted && !wdBlade.faulted && !faultLatched;
 
