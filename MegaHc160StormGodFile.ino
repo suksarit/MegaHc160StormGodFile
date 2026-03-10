@@ -2010,6 +2010,7 @@ bool updateSensors() {
       if (now - i2cStateStart_ms < 1)
         return false;
 
+      i2cBusClear();
       Wire.begin();
       Wire.setClock(100000);
       Wire.setWireTimeout(6000, true);
@@ -2068,6 +2069,8 @@ bool updateSensors() {
   static uint32_t curNextReady_ms = 0;
 
   constexpr uint16_t CUR_CONV_TIMEOUT_MS = 25;
+  static uint8_t adsTimeoutCnt = 0;
+  constexpr uint8_t ADS_TIMEOUT_LIMIT = 6;
 
   if (adsCurPresent) {
 
@@ -2097,6 +2100,7 @@ bool updateSensors() {
       if (now >= curNextReady_ms && adsCur.conversionComplete()) {
 
         int16_t raw = adsCur.getLastConversionResults();
+        adsTimeoutCnt = 0;
 
         float v = raw * ADS1115_LSB_V;
         float a = (v - g_acsOffsetV[curIdx]) / ACS_SENS_V_PER_A;
@@ -2113,10 +2117,19 @@ bool updateSensors() {
         sensorHealthyThisCycle = true;
 
         // ---------- CURRENT SPIKE ----------
+        static uint8_t spikeCnt = 0;
+
         if (a > CUR_SPIKE_A) {
 
-          forceDriveSoftStop(now);
-          bladeState = BladeState::SOFT_STOP;
+          if (++spikeCnt >= 2) {
+
+            forceDriveSoftStop(now);
+            bladeState = BladeState::SOFT_STOP;
+          }
+
+        } else {
+
+          spikeCnt = 0;
         }
 
         // ---------- HARD CURRENT LIMIT ----------
@@ -2148,7 +2161,26 @@ bool updateSensors() {
         Serial.println(curIdx);
 #endif
 
-        // ข้าม channel นี้
+        adsTimeoutCnt++;
+
+        // ถ้า timeout หลายครั้งติด
+        if (adsTimeoutCnt >= ADS_TIMEOUT_LIMIT) {
+
+#if DEBUG_SERIAL
+          Serial.println(F("[ADS CUR] RESET DEVICE"));
+#endif
+
+          adsCurPresent = adsCur.begin(0x48);
+
+          if (adsCurPresent) {
+            adsCur.setGain(GAIN_ONE);
+            adsCur.setDataRate(RATE_ADS1115_250SPS);
+          }
+
+          adsTimeoutCnt = 0;
+        }
+
+        // ข้าม channel
         curIdx++;
         if (curIdx >= 4)
           curIdx = 0;
@@ -2680,19 +2712,27 @@ void applyDrive() {
 
   constexpr uint16_t REVERSE_BRAKE_MS = 40;
 
+  // --------------------------------------------------
   // ทิศจริงของมอเตอร์
+  // --------------------------------------------------
   int8_t curSignL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
   int8_t curSignR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
 
-  // ทิศที่ต้องการใหม่
+  // --------------------------------------------------
+  // ทิศที่ต้องการ
+  // --------------------------------------------------
   int8_t tgtSignL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
   int8_t tgtSignR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
 
-  // reverse detection (จริง)
+  // --------------------------------------------------
+  // ตรวจ reverse จริง
+  // --------------------------------------------------
   bool reverseRequest =
     ((curSignL != 0 && tgtSignL != 0 && curSignL != tgtSignL) || (curSignR != 0 && tgtSignR != 0 && curSignR != tgtSignR)) && (abs(curL) > 150 || abs(curR) > 150);
 
+  // --------------------------------------------------
   // เริ่ม short brake
+  // --------------------------------------------------
   if (reverseRequest && !reverseBrakeActive) {
 
     reverseBrakeActive = true;
@@ -2703,7 +2743,9 @@ void applyDrive() {
 #endif
   }
 
-  // ระหว่าง brake
+  // --------------------------------------------------
+  // ระหว่าง short brake
+  // --------------------------------------------------
   if (reverseBrakeActive) {
 
     if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
@@ -2720,33 +2762,18 @@ void applyDrive() {
     } else {
 
       reverseBrakeActive = false;
-    }
-  }
 
-  if (reverseRequest && !reverseBrakeActive) {
-
-    reverseBrakeActive = true;
-    reverseBrakeStart_ms = now;
-  }
-
-  if (reverseBrakeActive) {
-
-    if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
-
-      setPWM_L(0);
-      setPWM_R(0);
-
-      motorShortBrake();
+      // ปลด short brake → DIR neutral
+      digitalWrite(DIR_L1, LOW);
+      digitalWrite(DIR_L2, LOW);
+      digitalWrite(DIR_R1, LOW);
+      digitalWrite(DIR_R2, LOW);
 
       curL = 0;
       curR = 0;
-
-      return;
-    } else {
-
-      reverseBrakeActive = false;
     }
   }
+
   // ==================================================
   // RAMP CONTROL (REVERSE SAFE)
   // ==================================================
@@ -3734,6 +3761,9 @@ void loop() {
   bool autoReverseInactive =
     !autoReverseActive;
 
+  bool dirSafe =
+    digitalRead(DIR_L1) == LOW && digitalRead(DIR_L2) == LOW && digitalRead(DIR_R1) == LOW && digitalRead(DIR_R2) == LOW;
+
   constexpr uint32_t DRIVER_ARM_MS = 80;
   constexpr uint32_t DRIVER_SETTLE_MS = 40;
 
@@ -3749,7 +3779,7 @@ void loop() {
   }
 
   // ---------------- ARM DRIVER ----------------
-  else if (runAllowed && pwmSafe && rcSafe && targetSafe && ibusConfirmed && autoReverseInactive) {
+  else if (runAllowed && pwmSafe && rcSafe && targetSafe && ibusConfirmed && autoReverseInactive && dirSafe) {
 
     if (driveEnableArmStart_ms == 0)
       driveEnableArmStart_ms = now;
