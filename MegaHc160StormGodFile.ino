@@ -399,6 +399,19 @@ constexpr uint8_t VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอ
 // UTIL
 // ============================================================================
 
+uint8_t crc8_update(uint8_t crc, uint8_t data) {
+  crc ^= data;
+
+  for (uint8_t i = 0; i < 8; i++) {
+    if (crc & 0x80)
+      crc = (crc << 1) ^ 0x07;
+    else
+      crc <<= 1;
+  }
+
+  return crc;
+}
+
 // ======================================================
 // FREE RAM (SRAM MONITOR)
 // AVR SRAM calculation
@@ -421,12 +434,11 @@ constexpr uint8_t VOLT_SENSOR_FAIL_COUNT = 3;      // ต้อง fail 3 รอ
 extern unsigned int __heap_start;
 extern void *__brkval;
 
-int freeRam()
-{
+int freeRam() {
   int stackTop;
 
-  void* heapTop = (__brkval == 0)
-                    ? (void*)&__heap_start
+  void *heapTop = (__brkval == 0)
+                    ? (void *)&__heap_start
                     : __brkval;
 
   return (int)&stackTop - (int)heapTop;
@@ -434,9 +446,8 @@ int freeRam()
 
 #else
 
-int freeRam()
-{
-  return -1; // not supported on non-AVR platforms
+int freeRam() {
+  return -1;  // not supported on non-AVR platforms
 }
 
 #endif
@@ -1152,25 +1163,8 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
   if (now - lastTx < TELEMETRY_PERIOD_MS) return;
   lastTx = now;
 
-  uint8_t chk = 0;
-
-  auto out = [&](const char* s) {
-    while (*s) {
-      chk ^= *s;
-      Serial.write(*s++);
-    }
-  };
-
-  auto outInt = [&](long v) {
-    char buf[16];
-    ltoa(v, buf, 10);
-    out(buf);
-  };
-
-  auto outChar = [&](char c) {
-    chk ^= c;
-    Serial.write(c);
-  };
+  char data[180];
+  uint8_t crc = 0;
 
   // ================= LOOP TIME =================
   uint32_t loopTime_us = micros() - loopStart_us;
@@ -1215,50 +1209,54 @@ void telemetryCSV(uint32_t now, uint32_t loopStart_us) {
     TEMP_LIMP_C
   };
 
-  SafetyState rawSafety =
-    evaluateSafetyRaw(sin, sth);
+  SafetyState rawSafety = evaluateSafetyRaw(sin, sth);
 
-  // ================= CSV OUTPUT =================
+  // ================= BUILD DATA =================
+  int len = snprintf(
+    data,
+    sizeof(data),
+    "%lu,%d,%d,%d.%d,%d.%d,%d,%d,%d.%d,%d.%d,%lu,%c,%c,%c,%c,%u,%d,%u,%u,%c,%c,%c",
+    now,
+    tempDriverL,
+    tempDriverR,
+    volt_x10 / 10, abs(volt_x10 % 10),
+    curMax_x10 / 10, abs(curMax_x10 % 10),
+    curL,
+    curR,
+    cpuLoad_x10 / 10, abs(cpuLoad_x10 % 10),
+    cpuMargin_x10 / 10, abs(cpuMargin_x10 % 10),
+    now - lastIbusByte_ms,
+    wdS,
+    wdC,
+    wdD,
+    wdB,
+    (uint8_t)activeFault,
+    freeRam(),
+    autoReverseCount,
+    (uint8_t)rawSafety,
+    adsCur,
+    adsVolt,
+    gimbalOn);
 
-  outInt(now); outChar(',');
+  // ================= CRC =================
+  char lenStr[6];
+  itoa(len, lenStr, 10);
 
-  outInt(tempDriverL); outChar(',');
-  outInt(tempDriverR); outChar(',');
+  for (uint8_t i = 0; lenStr[i]; i++)
+    crc = crc8_update(crc, lenStr[i]);
 
-  outInt(volt_x10 / 10); outChar('.');
-  outInt(abs(volt_x10 % 10)); outChar(',');
+  crc = crc8_update(crc, ',');
 
-  outInt(curMax_x10 / 10); outChar('.');
-  outInt(abs(curMax_x10 % 10)); outChar(',');
+  for (int i = 0; i < len; i++)
+    crc = crc8_update(crc, data[i]);
 
-  outInt(curL); outChar(',');
-  outInt(curR); outChar(',');
-
-  outInt(cpuLoad_x10 / 10); outChar('.');
-  outInt(abs(cpuLoad_x10 % 10)); outChar(',');
-
-  outInt(cpuMargin_x10 / 10); outChar('.');
-  outInt(abs(cpuMargin_x10 % 10)); outChar(',');
-
-  outInt(now - lastIbusByte_ms); outChar(',');
-
-  outChar(wdS); outChar(',');
-  outChar(wdC); outChar(',');
-  outChar(wdD); outChar(',');
-  outChar(wdB); outChar(',');
-
-  outInt((uint8_t)activeFault); outChar(',');
-  outInt(freeRam()); outChar(',');
-  outInt(autoReverseCount); outChar(',');
-  outInt((uint8_t)rawSafety); outChar(',');
-
-  outChar(adsCur); outChar(',');
-  outChar(adsVolt); outChar(',');
-  outChar(gimbalOn);
-
-  // ================= CHECKSUM =================
+  // ================= OUTPUT =================
+  Serial.print("$TN,");
+  Serial.print(len);
   Serial.print(',');
-  Serial.println(chk);
+  Serial.print(data);
+  Serial.print(',');
+  Serial.println(crc);
 
 #endif
 }
@@ -4177,5 +4175,3 @@ void loop() {
   // update loop progress marker
   lastLoopProgress_ms = now;
 }
-
-
