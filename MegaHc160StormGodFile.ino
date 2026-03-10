@@ -4070,7 +4070,7 @@ void loop() {
   // --------------------------------------------------
   int freeMem = freeRam();
 
-  if (freeMem < 400) {
+  if (freeMem < 600) {
 
 #if DEBUG_SERIAL
     Serial.print(F("[RAM] LOW MEMORY: "));
