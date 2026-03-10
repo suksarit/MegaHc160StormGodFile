@@ -543,10 +543,16 @@ void startAutoReverse(uint32_t now) {
   }
 
   // --------------------------------------------------
-  // VALIDATE DRIVE COMMAND (MUST BE MOVING)
+  // VALIDATE DRIVE COMMAND
+  // ต้องมีการสั่งเดินหน้าจริงจาก operator
   // --------------------------------------------------
+  if (abs(targetL) < 200 && abs(targetR) < 200) {
+    return;
+  }
+
+  // ต้องมีแรงขับจริง
   if (abs(curL) < 200 && abs(curR) < 200) {
-    return;  // รถแทบไม่ขยับ ไม่ต้อง reverse
+    return;
   }
 
   // --------------------------------------------------
@@ -2509,11 +2515,7 @@ void applyDrive() {
   // ==================================================
   // AUTO REVERSE
   // ==================================================
-  if (autoReverseActive &&
-      !ibusCommLost &&
-      !requireIbusConfirm &&
-      systemState == SystemState::ACTIVE &&
-      (abs(targetL) > 100 || abs(targetR) > 100)) {
+  if (autoReverseActive && !ibusCommLost && !requireIbusConfirm && systemState == SystemState::ACTIVE && (abs(targetL) > 100 || abs(targetR) > 100)) {
 
     if (now - autoReverseStart_ms < AUTO_REV_MS) {
 
@@ -2629,6 +2631,32 @@ void applyDrive() {
   }
 
   // ==================================================
+  // TRACTION CONTROL (ANTI WHEEL SPIN)
+  // ==================================================
+  constexpr float TRACTION_SLIP_DIFF = 18.0f;
+
+  float curDiff = fabs(curA_L - curA_R);
+
+  if (curDiff > TRACTION_SLIP_DIFF) {
+
+    constexpr float SLIP_REDUCE = 0.75f;
+    constexpr float GRIP_BOOST = 1.05f;
+
+    if (curA_L > curA_R) {
+
+      // ล้อซ้ายติด ล้อขวาฟรี
+      finalTargetR *= SLIP_REDUCE;
+      finalTargetL *= GRIP_BOOST;
+
+    } else {
+
+      // ล้อขวาติด ล้อซ้ายฟรี
+      finalTargetL *= SLIP_REDUCE;
+      finalTargetR *= GRIP_BOOST;
+    }
+  }
+
+  // ==================================================
   // IMBALANCE CORRECTION
   // ==================================================
   if (abs(targetL) > 80 || abs(targetR) > 80) {
@@ -2645,26 +2673,55 @@ void applyDrive() {
   }
 
   // ==================================================
-  // REVERSE SHORT BRAKE
+  // REVERSE SHORT BRAKE (REAL DIRECTION CHECK)
   // ==================================================
   static bool reverseBrakeActive = false;
   static uint32_t reverseBrakeStart_ms = 0;
 
-  static int8_t lastTargetSignL = 0;
-  static int8_t lastTargetSignR = 0;
-
-  int8_t signL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
-  int8_t signR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
-
-  bool reverseRequest =
-      ((signL != 0 && signL != lastTargetSignL) ||
-       (signR != 0 && signR != lastTargetSignR)) &&
-      (abs(curL) > 150 || abs(curR) > 150);
-
-  lastTargetSignL = signL;
-  lastTargetSignR = signR;
-
   constexpr uint16_t REVERSE_BRAKE_MS = 40;
+
+  // ทิศจริงของมอเตอร์
+  int8_t curSignL = (curL > 0) ? 1 : (curL < 0 ? -1 : 0);
+  int8_t curSignR = (curR > 0) ? 1 : (curR < 0 ? -1 : 0);
+
+  // ทิศที่ต้องการใหม่
+  int8_t tgtSignL = (finalTargetL > 0) ? 1 : (finalTargetL < 0 ? -1 : 0);
+  int8_t tgtSignR = (finalTargetR > 0) ? 1 : (finalTargetR < 0 ? -1 : 0);
+
+  // reverse detection (จริง)
+  bool reverseRequest =
+    ((curSignL != 0 && tgtSignL != 0 && curSignL != tgtSignL) || (curSignR != 0 && tgtSignR != 0 && curSignR != tgtSignR)) && (abs(curL) > 150 || abs(curR) > 150);
+
+  // เริ่ม short brake
+  if (reverseRequest && !reverseBrakeActive) {
+
+    reverseBrakeActive = true;
+    reverseBrakeStart_ms = now;
+
+#if DEBUG_SERIAL
+    Serial.println(F("[DRIVE] SHORT BRAKE"));
+#endif
+  }
+
+  // ระหว่าง brake
+  if (reverseBrakeActive) {
+
+    if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
+
+      setPWM_L(0);
+      setPWM_R(0);
+
+      motorShortBrake();
+
+      curL = 0;
+      curR = 0;
+
+      return;
+    } else {
+
+      reverseBrakeActive = false;
+    }
+  }
 
   if (reverseRequest && !reverseBrakeActive) {
 
@@ -2676,33 +2733,44 @@ void applyDrive() {
 
     if (now - reverseBrakeStart_ms < REVERSE_BRAKE_MS) {
 
+      setPWM_L(0);
+      setPWM_R(0);
+
       motorShortBrake();
 
       curL = 0;
       curR = 0;
 
       return;
-    }
-    else {
+    } else {
 
       reverseBrakeActive = false;
     }
   }
-
   // ==================================================
-  // RAMP CONTROL
+  // RAMP CONTROL (REVERSE SAFE)
   // ==================================================
   int16_t step;
 
   int16_t errMax = max(abs(finalTargetL - curL),
                        abs(finalTargetR - curR));
 
+  // ตรวจว่ากำลัง reverse
+  bool reversing =
+    ((curL > 0 && finalTargetL < 0) || (curL < 0 && finalTargetL > 0) || (curR > 0 && finalTargetR < 0) || (curR < 0 && finalTargetR > 0));
+
   if (driveState == DriveState::LIMP)
     step = 2;
+
+  else if (reversing)
+    step = 2;  // ramp ช้าลงตอน reverse
+
   else if (errMax > 600)
     step = 3;
+
   else if (errMax > 300)
     step = 4;
+
   else
     step = 6;
 
@@ -2731,10 +2799,11 @@ void applyDrive() {
   if (dirL != lastDirL && !dirSwitchPendingL) {
 
     setPWM_L(0);
+    curL = 0;
+
     dirSwitchPendingL = true;
     dirSwitchStartL_us = now_us;
   }
-
   if (dirSwitchPendingL && now_us - dirSwitchStartL_us >= DIR_DEADTIME_US) {
 
     digitalWrite(DIR_L1, dirL > 0);
@@ -2747,10 +2816,11 @@ void applyDrive() {
   if (dirR != lastDirR && !dirSwitchPendingR) {
 
     setPWM_R(0);
+    curR = 0;
+
     dirSwitchPendingR = true;
     dirSwitchStartR_us = now_us;
   }
-
   if (dirSwitchPendingR && now_us - dirSwitchStartR_us >= DIR_DEADTIME_US) {
 
     digitalWrite(DIR_R1, dirR > 0);
@@ -3366,13 +3436,7 @@ void setup() {
 
   revBlockUntilL = 0;
   revBlockUntilR = 0;
-  // ============================================================================
-  // REVERSE BRAKE STATE MACHINE
-  // ============================================================================
-  bool reverseBrakeActive = false;
-  uint32_t reverseBrakeStart_ms = 0;
 
-  constexpr uint16_t REVERSE_BRAKE_MS = 40;  // 30-50 ms recommended
   driveSoftStopStart_ms = 0;
   bladeSoftStopStart_ms = 0;
 
@@ -3690,9 +3754,14 @@ void loop() {
     if (driveEnableArmStart_ms == 0)
       driveEnableArmStart_ms = now;
 
+    // --------------------------------------------------
+    // DRIVER ARM COMPLETE
+    // --------------------------------------------------
+    static uint32_t pwmZeroStart_ms = 0;
+
     if (!driverEnabled && (now - driveEnableArmStart_ms >= DRIVER_ARM_MS)) {
 
-      // HARD PWM ZERO BEFORE DRIVER ENABLE
+      // บังคับ PWM = 0 ก่อน
       setPWM_L(0);
       setPWM_R(0);
 
@@ -3702,12 +3771,22 @@ void loop() {
       targetL = 0;
       targetR = 0;
 
-      digitalWrite(PIN_DRV_ENABLE, HIGH);
+      // เริ่มจับเวลา PWM zero hold
+      if (pwmZeroStart_ms == 0)
+        pwmZeroStart_ms = now;
 
-      driverEnabled = true;
-      driverSettling = true;
+      // รอ PWM settle
+      if (now - pwmZeroStart_ms >= 5) {
 
-      driverEnabled_ms = now;
+        digitalWrite(PIN_DRV_ENABLE, HIGH);
+
+        driverEnabled = true;
+        driverSettling = true;
+
+        driverEnabled_ms = now;
+
+        pwmZeroStart_ms = 0;
+      }
     }
   }
 
@@ -3744,12 +3823,19 @@ void loop() {
 #endif
 
   // ==================================================
-  // WATCHDOG FEED
+  // WATCHDOG FEED (PROGRESS SAFE)
   // ==================================================
+
+  static uint32_t lastLoopProgress_ms = 0;
+
   bool wdHealthy =
     !wdSensor.faulted && !wdComms.faulted && !wdDrive.faulted && !wdBlade.faulted && !faultLatched;
 
-  if (wdHealthy) {
+  // ตรวจว่า loop ยังเดินจริง
+  bool loopProgress =
+    (now - lastLoopProgress_ms < 200);
+
+  if (wdHealthy && loopProgress) {
 
     wdt_reset();
 
@@ -3760,4 +3846,7 @@ void loop() {
 
     digitalWrite(PIN_HW_WD_HB, LOW);
   }
+
+  // update loop progress marker
+  lastLoopProgress_ms = now;
 }
