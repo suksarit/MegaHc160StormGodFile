@@ -513,11 +513,30 @@ bool readDriverTempsPT100(int &tL, int &tR) {
 // ============================================================================
 void motorShortBrake() {
 
-  // ตัด PWM ก่อน
+  // --------------------------------------------------
+  // 1. CUT PWM
+  // --------------------------------------------------
   setPWM_L(0);
   setPWM_R(0);
 
-  // short brake
+  // --------------------------------------------------
+  // 2. CLEAR DIRECTION FIRST
+  // ป้องกัน cross conduction
+  // --------------------------------------------------
+  digitalWrite(DIR_L1, LOW);
+  digitalWrite(DIR_L2, LOW);
+
+  digitalWrite(DIR_R1, LOW);
+  digitalWrite(DIR_R2, LOW);
+
+  // --------------------------------------------------
+  // 3. DEADTIME
+  // --------------------------------------------------
+  delayMicroseconds(20);
+
+  // --------------------------------------------------
+  // 4. APPLY SHORT BRAKE
+  // --------------------------------------------------
   digitalWrite(DIR_L1, HIGH);
   digitalWrite(DIR_L2, HIGH);
 
@@ -2174,6 +2193,7 @@ bool updateSensors() {
   // ==================================================
   // ---------- I2C RECOVERY STATE MACHINE ----------
   // ==================================================
+  constexpr uint8_t I2C_MAX_RECOVER = 5;
 
   enum class I2CRecoverState : uint8_t {
     IDLE,
@@ -2219,33 +2239,81 @@ bool updateSensors() {
       return false;
 
     case I2CRecoverState::REINIT_ADS:
+      {
+        static uint8_t adsStage = 0;
 
-      adsCurPresent = adsCur.begin(0x48);
-      if (adsCurPresent) {
-        adsCur.setGain(GAIN_ONE);
-        adsCur.setDataRate(RATE_ADS1115_250SPS);
+        switch (adsStage) {
+
+          // ----------------------------
+          // ADS CURRENT
+          // ----------------------------
+          case 0:
+
+            adsCurPresent = adsCur.begin(0x48);
+
+            if (adsCurPresent) {
+              adsCur.setGain(GAIN_ONE);
+              adsCur.setDataRate(RATE_ADS1115_250SPS);
+            }
+
+            adsStage = 1;
+            return false;
+
+          // ----------------------------
+          // ADS VOLTAGE
+          // ----------------------------
+          case 1:
+
+            adsVoltPresent = adsVolt.begin(0x49);
+
+            if (adsVoltPresent) {
+              adsVolt.setGain(GAIN_ONE);
+              adsVolt.setDataRate(RATE_ADS1115_250SPS);
+            }
+
+            adsStage = 2;
+            return false;
+
+          // ----------------------------
+          // FINISH
+          // ----------------------------
+          case 2:
+
+            adsStage = 0;
+
+            i2cResetCount++;
+            i2cState = I2CRecoverState::DONE;
+
+            return false;
+        }
+
+        break;
       }
-
-      adsVoltPresent = adsVolt.begin(0x49);
-      if (adsVoltPresent) {
-        adsVolt.setGain(GAIN_ONE);
-        adsVolt.setDataRate(RATE_ADS1115_250SPS);
-      }
-
-      i2cResetCount++;
-      i2cState = I2CRecoverState::DONE;
-      return false;
 
     case I2CRecoverState::DONE:
 
-      if (i2cResetCount >= 3) {
+      // --------------------------------------------------
+      // MAX RECOVERY GUARD
+      // ป้องกัน recovery loop ไม่สิ้นสุด
+      // --------------------------------------------------
+      if (i2cResetCount >= I2C_MAX_RECOVER) {
+
+#if DEBUG_SERIAL
+        Serial.println(F("[I2C] MAX RECOVERY EXCEEDED"));
+#endif
+
         latchFault(FaultCode::VOLT_SENSOR_FAULT);
+
+        return false;
       }
 
-      // update cooldown timer
+      // --------------------------------------------------
+      // UPDATE COOLDOWN TIMER
+      // --------------------------------------------------
       lastRecover_ms = now;
 
       i2cState = I2CRecoverState::IDLE;
+
       return false;
 
     default:
@@ -2754,7 +2822,25 @@ void applyDrive() {
   // ==================================================
   if (autoReverseActive && !ibusCommLost && !requireIbusConfirm && systemState == SystemState::ACTIVE && (abs(targetL) > 100 || abs(targetR) > 100)) {
 
-    if (now - autoReverseStart_ms < AUTO_REV_MS) {
+    // ---------------------------------------------
+    // ADAPTIVE REVERSE TIME
+    // ---------------------------------------------
+    uint16_t revTime = AUTO_REV_MS;
+
+    if (autoReverseCount >= 2)
+      revTime = 500;
+
+    if (autoReverseCount >= 3)
+      revTime = 650;
+
+    // safety cap
+    if (revTime > 700)
+      revTime = 700;
+
+    // ---------------------------------------------
+    // RUN REVERSE
+    // ---------------------------------------------
+    if (now - autoReverseStart_ms < revTime) {
 
       int16_t refL = (curL != 0) ? curL : targetL;
       int16_t refR = (curR != 0) ? curR : targetR;
@@ -2766,6 +2852,7 @@ void applyDrive() {
       finalTargetR = dirR * AUTO_REV_PWM;
 
     } else {
+
       autoReverseActive = false;
 
       reverseRecoveryActive = true;
@@ -2783,26 +2870,37 @@ void applyDrive() {
   }
 
   // ==================================================
-  // TRACTION CONTROL
+  // TRACTION CONTROL (UNIFIED / HEADING SAFE)
   // ==================================================
-  float diff = fabs(curA_L - curA_R);
 
-  constexpr float TRACTION_DIFF = 30.0f;
+  constexpr float TRACTION_SLIP_DIFF = 18.0f;
 
-  if (diff > TRACTION_DIFF) {
+  float curDiff = fabs(curA_L - curA_R);
 
-    constexpr float TRACTION_REDUCE = 0.75f;
-    constexpr float TRACTION_BOOST = 1.10f;
+  // ใช้ throttle magnitude ป้องกัน false trigger ตอนช้า
+  int16_t pwmMag = max(abs(finalTargetL), abs(finalTargetR));
 
+  constexpr int16_t TRACTION_MIN_PWM = 200;
+
+  if (pwmMag > TRACTION_MIN_PWM && curDiff > TRACTION_SLIP_DIFF) {
+
+    constexpr float SLIP_REDUCE = 0.75f;
+
+    // --------------------------------------------------
+    // LEFT HAS GRIP / RIGHT SLIPPING
+    // --------------------------------------------------
     if (curA_L > curA_R) {
 
-      finalTargetL *= TRACTION_REDUCE;
-      finalTargetR *= TRACTION_BOOST;
+      finalTargetR *= SLIP_REDUCE;
 
-    } else {
+    }
 
-      finalTargetR *= TRACTION_REDUCE;
-      finalTargetL *= TRACTION_BOOST;
+    // --------------------------------------------------
+    // RIGHT HAS GRIP / LEFT SLIPPING
+    // --------------------------------------------------
+    else {
+
+      finalTargetL *= SLIP_REDUCE;
     }
   }
 
@@ -2878,32 +2976,6 @@ void applyDrive() {
 
   finalTargetL *= stallScale;
   finalTargetR *= stallScale;
-
-  // ==================================================
-  // TRACTION CONTROL (ANTI WHEEL SPIN)
-  // ==================================================
-  constexpr float TRACTION_SLIP_DIFF = 18.0f;
-
-  float curDiff = fabs(curA_L - curA_R);
-
-  if (curDiff > TRACTION_SLIP_DIFF) {
-
-    constexpr float SLIP_REDUCE = 0.75f;
-    constexpr float GRIP_BOOST = 1.05f;
-
-    if (curA_L > curA_R) {
-
-      // ล้อซ้ายติด ล้อขวาฟรี
-      finalTargetR *= SLIP_REDUCE;
-      finalTargetL *= GRIP_BOOST;
-
-    } else {
-
-      // ล้อขวาติด ล้อซ้ายฟรี
-      finalTargetL *= SLIP_REDUCE;
-      finalTargetR *= GRIP_BOOST;
-    }
-  }
 
   // ==================================================
   // IMBALANCE CORRECTION
@@ -3097,8 +3169,13 @@ void applyDrive() {
   uint16_t pwmL = abs(curL);
   uint16_t pwmR = abs(curR);
 
-  if (micros() - pwmResumeL_us < PWM_RESUME_DELAY_US)
+  uint32_t now_us2 = micros();
+
+  if (now_us2 - pwmResumeL_us < PWM_RESUME_DELAY_US)
     pwmL = 0;
+
+  if (now_us2 - pwmResumeR_us < PWM_RESUME_DELAY_US)
+    pwmR = 0;
 
   setPWM_L(pwmL);
   setPWM_R(pwmR);
@@ -4175,3 +4252,4 @@ void loop() {
   // update loop progress marker
   lastLoopProgress_ms = now;
 }
+
